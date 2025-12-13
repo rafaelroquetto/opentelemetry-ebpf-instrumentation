@@ -5,6 +5,7 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_endian.h>
 #include <bpfcore/bpf_helpers.h>
+#include <bpfcore/utils.h>
 
 #include <common/go_addr_key.h>
 #include <logger/bpf_dbg.h>
@@ -37,6 +38,8 @@ enum { k_ip4_option_code = 0x88 };
 // as each individual bit plays a role
 enum : u8 { k_ip6_option_code = 0x1e };
 
+enum : u8 { k_tcp_option_kind_otel = 25 };
+
 typedef struct ipv4_opt_t {
     u8 type;
     u8 len;
@@ -63,6 +66,15 @@ typedef struct ipv6_opt_t {
 _Static_assert(sizeof(ipv6_opt) % 8 == 0, "ipv6_opt not 8-byte aligned");
 _Static_assert(sizeof(ipv6_opt) == 32, "invalid IPv6 option len");
 
+struct tcp_option {
+    u8 kind;
+    u8 len;
+    unsigned char trace_id[TRACE_ID_SIZE_BYTES];
+    unsigned char span_id[SPAN_ID_SIZE_BYTES];
+    u16 pad;
+};
+
+_Static_assert(sizeof(struct tcp_option) % 4 == 0, "tcp_option not 4-byte aligned");
 enum protocol { protocol_ip4, protocol_ip6, protocol_unknown };
 
 static __always_inline u16 ip_header_off(struct __sk_buff *ctx) {
@@ -433,6 +445,8 @@ static __always_inline bool parse_ip_options_ipv6(struct __sk_buff *skb, connect
 }
 
 static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_info_pid_t *tp) {
+    bpf_skb_pull_data(skb, skb->len);
+
     const u16 ip4_off = ip_header_off(skb);
 
     if (ip4_off == 0) {
@@ -445,6 +459,7 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
         return;
     }
 
+    bpf_printk("FOO 0");
     if (iphdr->version != 4) {
         return;
     }
@@ -453,10 +468,55 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
         return;
     }
 
-    if (bpf_skb_adjust_room(skb, sizeof(ipv4_opt), BPF_ADJ_ROOM_NET, 0) != 0) {
+    const u16 ihl_bytes = iphdr->ihl << 2;
+    bpf_printk("FOO 1 ihl = %u, skb>len = %u", ihl_bytes, skb->len);
+
+    struct tcphdr *tcp = (struct tcphdr *)(((void *)iphdr) + ihl_bytes);
+
+    if ((void *)(tcp + 1) > ctx_data_end(skb)) {
         return;
     }
 
+    u16 doff_bytes = tcp->doff * 4;
+
+    if (doff_bytes > 60) {
+        return;
+    }
+
+    bpf_clamp_umax(doff_bytes, 60);
+
+    bpf_printk("FOO 2");
+
+    unsigned char *tcp_p = (unsigned char *)tcp;
+
+    if ((void *)tcp_p + doff_bytes > ctx_data_end(skb)) {
+        return;
+    }
+
+    char orig_tcp_buf[60];
+
+    bpf_printk("FOO 3");
+
+    // save the header
+    for (u8 i = 0; i < 60; ++i) {
+        if (i >= doff_bytes) {
+            break;
+        }
+
+        if ((void *)&tcp_p[i] >= ctx_data_end(skb)) {
+            return;
+        }
+
+        orig_tcp_buf[i] = tcp_p[i];
+    }
+
+    if (bpf_skb_adjust_room(skb, sizeof(struct tcp_option), BPF_ADJ_ROOM_NET, 0) != 0) {
+        return;
+    }
+
+    bpf_skb_pull_data(skb, skb->len);
+
+    bpf_printk("FOO 4");
     // reload pointers
     iphdr = ctx_data(skb) + ip4_off;
 
@@ -464,34 +524,51 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
         return;
     }
 
-    const u16 ihl_bytes = iphdr->ihl << 2;
+    bpf_printk("FOO 5");
+    tcp = (struct tcphdr *)(((void *)iphdr) + ihl_bytes);
 
-    unsigned char *ptr = ((unsigned char *)iphdr) + ihl_bytes;
-    unsigned char *ptr_b = ptr;
-
-    if ((void *)ptr + sizeof(ipv4_opt) > ctx_data_end(skb)) {
+    if ((void *)(tcp + 1) > ctx_data_end(skb)) {
         return;
     }
 
-    *ptr++ = k_ip4_option_code;
-    *ptr++ = sizeof(ipv4_opt);
+    tcp_p = (unsigned char *)tcp;
 
-    __builtin_memcpy(ptr, tp->tp.trace_id, TRACE_ID_SIZE_BYTES);
+    if ((void *)tcp_p + doff_bytes > ctx_data_end(skb)) {
+        return;
+    }
 
-    ptr += TRACE_ID_SIZE_BYTES;
-    *ptr++ = 0;
-    *ptr++ = 0;
+    bpf_printk("FOO 7");
+    // write back the header
+    for (u8 i = 0; i < 60; ++i) {
+        if (i >= doff_bytes) {
+            break;
+        }
+
+        tcp_p[i] = orig_tcp_buf[i];
+    }
+
+    // update new data offset
+    tcp->doff = (doff_bytes + sizeof(struct tcp_option)) / 4;
+
+    struct tcp_option *tcp_opt = (struct tcp_option *)(tcp_p + doff_bytes);
+
+    if ((void *)(tcp_opt + 1) > ctx_data_end(skb)) {
+        return;
+    }
+
+    bpf_printk("FOO 8");
+    tcp_opt->kind = k_tcp_option_kind_otel;
+    tcp_opt->len = sizeof(struct tcp_option);
+
+    __builtin_memcpy(tcp_opt->trace_id, tp->tp.trace_id, TRACE_ID_SIZE_BYTES);
+    __builtin_memcpy(tcp_opt->span_id, tp->tp.span_id, SPAN_ID_SIZE_BYTES);
+
+    tcp_opt->pad = 0;
 
     // update IP header and checksum
-    const u16 old_vihl_tos = *(u16 *)iphdr;
-
-    iphdr->ihl += (sizeof(ipv4_opt) >> 2);
-
-    const u16 new_vihl_tos = *(u16 *)iphdr;
-
     const u16 old_tot_len = iphdr->tot_len;
 
-    iphdr->tot_len = bpf_htons(bpf_ntohs(iphdr->tot_len) + sizeof(ipv4_opt));
+    iphdr->tot_len = bpf_htons(bpf_ntohs(iphdr->tot_len) + sizeof(struct tcp_option));
 
     const u16 new_tot_len = iphdr->tot_len;
 
@@ -499,11 +576,9 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
 
     iphdr->check = 0;
 
-    const u32 opt_sum = bpf_csum_diff(NULL, 0, (__be32 *)ptr_b, ptr - ptr_b, 0);
+    const u32 opt_sum = bpf_csum_diff(NULL, 0, (__be32 *)tcp_opt, (tcp_opt + 1) - tcp_opt, 0);
 
     sum += opt_sum;
-    sum += (~old_vihl_tos & 0xffff);
-    sum += new_vihl_tos;
     sum += (~old_tot_len & 0xffff);
     sum += new_tot_len;
     sum = (sum & 0xffff) + (sum >> 16);
@@ -511,14 +586,6 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
 
     const u16 new_check = ~sum;
     iphdr->check = new_check;
-
-    const struct tcphdr *tcp = (struct tcphdr *)ptr;
-
-    if ((const void *)(tcp + 1) > ctx_data_end(skb)) {
-        return;
-    }
-
-    populate_span_id_from_seq_ack(&tp->tp, tcp->seq, tcp->ack_seq);
 
     print_tp("injected", &tp->tp);
 }
