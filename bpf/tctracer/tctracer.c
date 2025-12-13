@@ -140,7 +140,7 @@ static __always_inline bool conn_info_from_skb4(struct __sk_buff *skb, connectio
     conn->s_port = bpf_ntohs(tcp->source);
     conn->d_port = bpf_ntohs(tcp->dest);
 
-    return conn;
+    return true;
 }
 
 static __always_inline bool conn_info_from_skb6(struct __sk_buff *skb, connection_info_t *conn) {

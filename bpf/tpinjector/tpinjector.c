@@ -266,9 +266,9 @@ static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u
 
 // Helper that writes in the sock map for a sock_ops program
 static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
-    connection_info_t conn = get_connection_info_ops(skops);
+    //connection_info_t conn = get_connection_info_ops(skops);
 
-    bpf_sock_hash_update(skops, &sock_dir, &conn, BPF_ANY);
+    //bpf_sock_hash_update(skops, &sock_dir, &conn, BPF_ANY);
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
 }
 
@@ -395,6 +395,7 @@ int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
         bpf_sock_ops_write_hdr_cb(skops);
         break;
     case BPF_SOCK_OPS_PARSE_HDR_OPT_CB:
+        bpf_printk("BPF_SOCK_OPS_PARSE_HDR_OPT_CB");
         bpf_sock_ops_parse_hdr_cb(skops);
         break;
     default:
@@ -672,6 +673,7 @@ static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
 // Traceparent string.
 SEC("sk_msg")
 int obi_packet_extender(struct sk_msg_md *msg) {
+    bpf_dbg_printk("== %s ==", __FUNCTION__);
     // If neither injection method is enabled, nothing to do
     if (!(inject_flags & (k_inject_http_headers | k_inject_tcp_options))) {
         return SK_PASS;
