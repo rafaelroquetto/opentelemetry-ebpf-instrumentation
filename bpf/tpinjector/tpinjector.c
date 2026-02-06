@@ -4,6 +4,7 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_endian.h>
+#include <bpfcore/bpf_tracing.h>
 
 #include <common/common.h>
 #include <common/connection_info.h>
@@ -30,6 +31,27 @@
 #include <maps/sock_dir.h>
 
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
+
+struct sk_storage_data {
+    u64 pid_tgid;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, u32);
+    __type(value, struct sk_storage_data);
+} sk_storage_map SEC(".maps");
+
+struct socket_data {
+    u64 pid_tgid;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, u64);
+    __type(value, struct socket_data);
+} sk_data_map SEC(".maps");
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -288,11 +310,31 @@ static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info
     return true;
 }
 
+static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *skops) {
+#if 0
+    const u64 cookie = bpf_get_socket_cookie(skops->sk);
+
+    if (!bpf_sk_storage_get(&sock_storage, skops->sk, &cookie, BPF_SK_STORAGE_GET_F_CREATE)) {
+        bpf_dbg_printk("failed to initialize socket storage");
+        return;
+    }
+
+    struct socket_data *data = new_sk_data(cookie);
+
+    if (!data) {
+        bpf_dbg_printk("failed to initialize socket data");
+        bpf_sk_storage_delete(&sock_storage, skops->sk);
+        return;
+    }
+
+    data->pid_tgid = bpf_get_current_pid_tgid();
+#endif
+}
+
 static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u8 flags) {
     bpf_sock_ops_cb_flags_set(skops, skops->bpf_sock_ops_cb_flags | flags);
 }
 
-// Helper that writes in the sock map for a sock_ops program
 static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
     connection_info_t conn = get_connection_info_ops(skops);
 
@@ -301,6 +343,9 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
 }
 
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
+    connection_info_t conn = get_connection_info_ops(skops);
+
+    bpf_sock_hash_update(skops, &sock_dir, &conn, BPF_ANY);
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
 }
 
@@ -410,6 +455,9 @@ int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
     }
 
     switch (skops->op) {
+    case BPF_SOCK_OPS_TCP_CONNECT_CB:
+        bpf_sock_ops_tcp_connect_cb(skops);
+        break;
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
         bpf_sock_ops_active_est_cb(skops);
         break;
@@ -729,6 +777,7 @@ int obi_packet_extender(struct sk_msg_md *msg) {
         return SK_PASS;
     }
 
+    bpf_printk("obi_packet_extender");
     // At this stage, there were no previously TP information setup - it's the first
     // time we are seeing this packet - so we need to detect whether this is the start
     // of a new request and perform any injection if so.
@@ -974,4 +1023,264 @@ int obi_packet_extender_create_tp(struct sk_msg_md *msg) {
     }
 
     return SK_PASS;
+}
+
+// ----- ingress programs
+
+enum {
+    k_tail_ingress_http_req,
+    k_tail_ingress_http_create_tp,
+};
+
+int obi_ingress_http_req(struct __sk_buff *skb);
+int obi_ingress_http_create_tp(struct __sk_buff *skb);
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 2);
+    __uint(key_size, sizeof(u32));
+    __array(values, int(void *));
+} ingress_jump_table SEC(".maps") = {
+    .values =
+        {
+            [k_tail_ingress_http_req] = (void *)&obi_ingress_http_req,
+            [k_tail_ingress_http_create_tp] = (void *)&obi_ingress_http_create_tp,
+        },
+};
+
+typedef struct ingress_tailcall_ctx {
+    u8 niter;
+} ingress_tailcall_ctx;
+
+SCRATCH_MEM(ingress_tailcall_ctx);
+
+// k_tail_ingress_http_create_tp
+SEC("sk_skb/stream_verdict")
+int obi_ingress_http_create_tp(struct __sk_buff *skb) {
+    ingress_tailcall_ctx *t_ctx = ingress_tailcall_ctx_mem();
+
+    if (!t_ctx) {
+        return SK_PASS;
+    }
+
+    if (bpf_skb_change_head(skb, TP_SIZE, 0) != 0) {
+        return SK_PASS;
+    }
+
+    bpf_skb_pull_data(skb, skb->len);
+
+    unsigned char *ptr = ctx_data(skb);
+    const unsigned char *e = ctx_data_end(skb);
+
+    const u32 data_size = (e - ptr) & 0x3ff;
+
+    for (u32 i = 0; i < data_size; ++i) {
+        if (ptr + TP_SIZE + 1 >= e) {
+            break;
+        }
+
+        *ptr = *(ptr + TP_SIZE);
+
+        if (*ptr == '\n')
+            break;
+
+        ++ptr;
+    }
+
+    ++ptr;
+
+    if (ptr + TP_SIZE > e) {
+        return SK_PASS;
+    }
+
+    __builtin_memcpy((void *)ptr, TP, TP_SIZE);
+
+    bpf_printk("BUF = %s", ctx_data(skb));
+    return SK_PASS;
+}
+
+static __always_inline void tail_call_to_ingress_http_create_tp(struct __sk_buff *skb,
+                                                                ingress_tailcall_ctx *t_ctx) {
+    t_ctx->niter = 0;
+    bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_create_tp);
+}
+
+SEC("sk_skb/stream_verdict")
+int obi_ingress_http_req(struct __sk_buff *skb) {
+    const u32 k_max_iter = 4; // iterate up to 4KB
+
+    ingress_tailcall_ctx *t_ctx = ingress_tailcall_ctx_mem();
+
+    if (!t_ctx) {
+        return SK_PASS;
+    }
+
+    tp_info_pid_t *tp_p = tp_buf();
+
+    if (!tp_p) {
+        return SK_PASS;
+    }
+
+    const u32 niter = t_ctx->niter;
+
+    if (niter >= k_max_iter) {
+        return SK_PASS;
+    }
+
+    unsigned char *b = ctx_data(skb);
+    const unsigned char *e = ctx_data_end(skb);
+    unsigned char *ptr = b + (niter * 1024);
+
+    if (ptr >= e) {
+        return SK_PASS;
+    }
+
+    const u32 data_size = (e - ptr) & 0x3ff; // 1KB chunks per iteration
+
+    for (u32 i = 0; i < data_size; ++i) {
+        if (ptr + TP_SIZE >= e || is_eoh(ptr)) {
+            tail_call_to_ingress_http_create_tp(skb, t_ctx);
+            break;
+        }
+
+        if (is_traceparent(ptr)) {
+            ptr += TP_TID_PREFIX_SIZE;
+
+            decode_hex(tp_p->tp.trace_id, ptr, TRACE_ID_CHAR_LEN);
+
+            ptr += TRACE_ID_CHAR_LEN;
+
+            if (*ptr++ != '-') {
+                return SK_PASS;
+            }
+
+            decode_hex(tp_p->tp.span_id, ptr, SPAN_ID_CHAR_LEN);
+
+            //unsigned char *span_id = ptr;
+
+            ptr += SPAN_ID_CHAR_LEN;
+
+            if (*ptr++ != '-') {
+                return SK_PASS;
+            }
+
+            decode_hex((unsigned char *)&tp_p->tp.flags, ptr, FLAGS_CHAR_LEN);
+
+            ptr += FLAGS_CHAR_LEN;
+
+            if (*ptr++ != '\r' || *ptr != '\n') {
+                return SK_PASS;
+            }
+
+            // if we got to this point, we managed to parse a valid
+            // 'Traceparent: ...' header that we can utilise
+
+            //assign_parent_tp(t_ctx, &tp_p->tp, span_id);
+
+            tp_p->tp.ts = bpf_ktime_get_ns();
+            tp_p->tp.flags = 1;
+            tp_p->valid = 1;
+            tp_p->written = 1;
+            //tp_p->pid = t_ctx->p_conn.pid;
+            tp_p->req_type = EVENT_HTTP_CLIENT;
+
+            print_tp("found TP in headers", &tp_p->tp);
+
+#if 0
+            set_tp_info_pid(&t_ctx->e_key, tp_p);
+
+            if (inject_flags & k_inject_tcp_options) {
+                schedule_write_tcp_option(msg, tp_p);
+            }
+#endif
+
+            return SK_PASS;
+        }
+
+        ++ptr;
+    }
+
+    t_ctx->niter++;
+
+    if (t_ctx->niter < k_max_iter) {
+        bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_req);
+    } else {
+        tail_call_to_ingress_http_create_tp(skb, t_ctx);
+    }
+
+    return SK_PASS;
+}
+
+static __always_inline void handle_http_req(struct __sk_buff *skb) {
+    bpf_skb_pull_data(skb, MIN_HTTP_REQ_SIZE);
+
+    const unsigned char *b = ctx_data(skb);
+    const unsigned char *e = ctx_data_end(skb);
+
+    if (b + MIN_HTTP_REQ_SIZE > e) {
+        return;
+    }
+
+    if (is_http_request_buf(b)) {
+        ingress_tailcall_ctx *t_ctx = ingress_tailcall_ctx_mem();
+
+        if (!t_ctx) {
+            return;
+        }
+
+        t_ctx->niter = 0;
+
+        bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_req);
+    }
+}
+
+SEC("sk_skb/stream_verdict")
+int obi_ingress_verdict(struct __sk_buff *skb) {
+    struct bpf_sock *sk = skb->sk;
+
+    if (!sk) {
+        bpf_printk("null sock");
+        return SK_PASS;
+    }
+
+    const struct sk_storage_data *sk_data = bpf_sk_storage_get(&sk_storage_map, sk, NULL, 0);
+
+    if (!sk_data) {
+        bpf_printk("could not find socket data");
+        return SK_PASS;
+    }
+
+    bpf_printk("socket has pid: %u", (u32)sk_data->pid_tgid);
+
+    if (!valid_pid(sk_data->pid_tgid)) {
+        return SK_PASS;
+    }
+
+    const u64 cookie = bpf_get_socket_cookie(skb);
+
+    bpf_printk("obi_ingress_verdict: %llu", cookie);
+    handle_http_req(skb);
+
+    return SK_PASS;
+}
+
+// used to map a socket cookie to a pid
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accepted_sk) {
+    const u64 cookie = bpf_get_socket_cookie(sk);
+    const u64 accepted_cookie = bpf_get_socket_cookie(accepted_sk);
+    const u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    bpf_printk("inet_csk_accept: pid = %u, cookie = %llu, accepted_cookie = %llu",
+               pid,
+               cookie,
+               accepted_cookie);
+
+    struct sk_storage_data data = {.pid_tgid = bpf_get_current_pid_tgid()};
+
+    if (!bpf_sk_storage_get(&sk_storage_map, accepted_sk, &data, BPF_SK_STORAGE_GET_F_CREATE)) {
+        bpf_printk("failed to initialise socket storage");
+    }
+
+    return 0;
 }

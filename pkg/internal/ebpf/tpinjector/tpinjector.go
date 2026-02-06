@@ -119,6 +119,11 @@ func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
+		{
+			Program:  p.bpfObjects.ObiIngressVerdict,
+			MapFD:    p.bpfObjects.SockDir.FD(),
+			AttachAs: ebpf.AttachSkSKBStreamVerdict,
+		},
 	}
 }
 
@@ -136,7 +141,12 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter {
 }
 
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing {
-	return nil
+	return []*ebpfcommon.Tracing{
+		{
+			Program:  p.bpfObjects.ObiInetCskAccept,
+			AttachAs: ebpf.AttachTraceFExit,
+		},
+	}
 }
 
 func (p *Tracer) RecordInstrumentedLib(uint64, []io.Closer) {}
