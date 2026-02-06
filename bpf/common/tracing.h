@@ -92,7 +92,8 @@ static __always_inline u64 current_immediate_epoch(u64 ts) {
     return temp * NANOSECONDS_PER_IMM_EPOCH;
 }
 
-static __always_inline u8 correlated_requests(tp_info_t *tp, tp_info_pid_t *existing_tp) {
+static __always_inline u8 correlated_requests(const tp_info_t *tp,
+                                              const tp_info_pid_t *existing_tp) {
     if (!existing_tp) {
         return 0;
     }
