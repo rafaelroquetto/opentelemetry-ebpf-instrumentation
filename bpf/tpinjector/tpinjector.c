@@ -6,12 +6,13 @@
 #include <bpfcore/bpf_endian.h>
 #include <bpfcore/bpf_tracing.h>
 
-#include <common/common.h>
 #include <common/connection_info.h>
 #include <common/egress_key.h>
 #include <common/http_buf_size.h>
+#include <common/http_info.h>
 #include <common/http_types.h>
 #include <common/msg_buffer.h>
+#include <common/protocol_defs.h>
 #include <common/scratch_mem.h>
 #include <common/ssl_helpers.h>
 #include <common/tc_common.h>
@@ -45,12 +46,23 @@ struct {
 
 enum sk_type : u8 { sk_type_client, sk_type_server };
 
+union request_info {
+    u8 flags;
+    http_info_t http;
+};
+
 struct socket_data {
     u64 pid_tgid;
+    u64 accept_time;
+    pid_info pid_info;
+    u32 task_tid;
+    union request_info request;
     connection_info_t conn;
     enum sk_type sk_type;
-    u8 pad[3];
+    u8 _pad[3];
 };
+
+static const struct socket_data _sock_data_zero = {};
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -75,20 +87,27 @@ volatile const u32 inject_flags =
 // Better than experimental options (253-254) which must not be shipped as defaults
 enum { k_tcp_option_kind_otel = 25 };
 
-enum { k_tail_write_msg_traceparent, k_tail_find_existing_tp, k_tail_create_tp };
+enum {
+    k_tail_packet_extender,
+    k_tail_write_msg_traceparent,
+    k_tail_find_existing_tp,
+    k_tail_create_tp
+};
 
+int obi_packet_extender(struct sk_msg_md *msg);
 int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg);
 int obi_packet_extender_find_existing_tp(struct sk_msg_md *msg);
 int obi_packet_extender_create_tp(struct sk_msg_md *msg);
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 3);
+    __uint(max_entries, 4);
     __uint(key_size, sizeof(u32));
     __array(values, int(void *));
 } extender_jump_table SEC(".maps") = {
     .values =
         {
+            [k_tail_packet_extender] = (void *)&obi_packet_extender,
             [k_tail_write_msg_traceparent] = (void *)&obi_packet_extender_write_msg_tp,
             [k_tail_find_existing_tp] = (void *)&obi_packet_extender_find_existing_tp,
             [k_tail_create_tp] = (void *)&obi_packet_extender_create_tp,
@@ -110,6 +129,14 @@ SCRATCH_MEM_SIZED(tp_str_buf, 64)
 #ifndef ENOMSG
 #define ENOMSG 42
 #endif
+
+static __always_inline struct socket_data *init_sock_data(u64 cookie) {
+    // struct socket_data is too big to fit on the stack, so we 0 initialise
+    // from a static (map) value
+    bpf_map_update_elem(&sk_data_map, &cookie, &_sock_data_zero, BPF_ANY);
+
+    return bpf_map_lookup_elem(&sk_data_map, &cookie);
+}
 
 struct tp_option {
     u8 kind;
@@ -221,7 +248,7 @@ static __always_inline connection_info_t sk_ops_extract_key_ip4(struct bpf_sock_
 // The order of copying the data from bpf_sock_ops matters and must match how
 // the struct is laid in vmlinux.h, otherwise the verifier thinks we are modifying
 // the context twice.
-static __always_inline connection_info_t sk_ops_extract_key_ip6(struct bpf_sock_ops *ops) {
+static __always_inline connection_info_t sk_ops_extract_key_ip6(volatile struct bpf_sock_ops *ops) {
     connection_info_t conn = {};
 
     conn.d_ip[0] = ops->remote_ip6[0];
@@ -332,10 +359,15 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    struct socket_data data = {
-        .pid_tgid = id, .conn = get_connection_info_ops(skops), .sk_type = sk_type_client};
+    struct socket_data *data = init_sock_data(cookie);
 
-    bpf_map_update_elem(&sk_data_map, &cookie, &data, BPF_ANY);
+    if (!data) {
+        return;
+    }
+
+    data->pid_tgid = id;
+    data->conn = get_connection_info_ops(skops);
+    data->sk_type = sk_type_client;
 
     struct sk_storage_data sk_data = {.sk_cookie = cookie};
 
@@ -369,9 +401,16 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
 
     const u64 cookie = bpf_get_socket_cookie(skops);
 
-    struct socket_data data = {.conn = get_connection_info_ops(skops), .sk_type = sk_type_server};
+    struct socket_data *data = init_sock_data(cookie);
 
-    bpf_map_update_elem(&sk_data_map, &cookie, &data, BPF_ANY);
+    if (!data) {
+        return;
+    }
+
+    data->conn = get_connection_info_ops(skops);
+    data->sk_type = sk_type_server;
+
+    bpf_map_update_elem(&sk_data_map, &cookie, data, BPF_ANY);
 
     // store cookie in socket storage for sk_msg
     struct sk_storage_data sk_data = {.sk_cookie = cookie};
@@ -382,7 +421,7 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    bpf_sock_hash_update(skops, &sock_dir, &data.conn, BPF_ANY);
+    bpf_sock_hash_update(skops, &sock_dir, &data->conn, BPF_ANY);
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
 }
 
@@ -784,6 +823,84 @@ static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
 // Sock_msg program which detects packets where it should add space for
 // the 'Traceparent' string. It extends the HTTP header and writes the
 // Traceparent string.
+SEC("sk_msg")
+int obi_egress_prog(struct sk_msg_md *msg) {
+    bpf_printk("obi_egress_prog 0");
+    const struct sk_storage_data *sk_data = bpf_sk_storage_get(&sk_storage_map, msg->sk, NULL, 0);
+
+    if (!sk_data) {
+        bpf_printk("no sk data msg->sk = %llx", msg->sk);
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 1");
+    struct socket_data *data = bpf_map_lookup_elem(&sk_data_map, &sk_data->sk_cookie);
+
+    if (!data) {
+        bpf_printk("socket no longer tracked, cleaning up storage");
+
+        bpf_sk_storage_delete(&sk_storage_map, msg->sk);
+
+        return SK_PASS;
+    }
+    bpf_printk("obi_egress_prog 2");
+
+    if (data->sk_type == sk_type_client) {
+        bpf_tail_call_static(msg, &extender_jump_table, k_tail_packet_extender);
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 3");
+    if (data->request.flags != EVENT_K_HTTP_REQUEST) {
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 4");
+    bpf_msg_pull_data(msg, 0, msg->size, 0);
+
+    const unsigned char *ptr = msg->data;
+    const unsigned char *e = msg->data_end;
+
+    const char HTTP_RES[] = "HTTP/1.x 000";
+    const size_t HTTP_RES_SIZE = sizeof(HTTP_RES) - 1;
+
+    if (ptr + HTTP_RES_SIZE > e) {
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 5");
+    if (__bpf_memcmp(ptr, HTTP_RES, 7) != 0) {
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 6");
+    ptr += 7;
+
+    u16 status = (*ptr++ - '0') * 100;
+    status += (*ptr++ - '0') * 10;
+    status += *ptr - '0';
+
+    http_info_t *trace = bpf_ringbuf_reserve(&events, sizeof(http_info_t), 0);
+
+    if (!trace) {
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_egress_prog 7");
+    *trace = data->request.http;
+    trace->status = status;
+    trace->end_monotime_ns = bpf_ktime_get_ns();
+    trace->resp_len = msg->size;
+
+    bpf_ringbuf_submit(trace, get_flags());
+
+    bpf_printk("BUF = %s", msg->data);
+
+    __builtin_memset(&data->request, 0, sizeof(data->request));
+
+    return SK_PASS;
+}
+
 SEC("sk_msg")
 int obi_packet_extender(struct sk_msg_md *msg) {
     // If neither injection method is enabled, nothing to do
@@ -1192,7 +1309,8 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
     }
 
     const u64 cookie = bpf_get_socket_cookie(skb);
-    const struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
+
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
 
     if (!sk_data) {
         return SK_PASS;
@@ -1222,6 +1340,14 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
         new_trace_id(&tp_p->tp);
         __builtin_memset(tp_p->tp.parent_id, 0, SPAN_ID_SIZE_BYTES);
     }
+
+    assign_server_parent_tp(&sk_data->conn, &tp_p->tp);
+
+    sk_data->request.http.tp = tp_p->tp;
+
+    print_tp("created new TP", &tp_p->tp);
+
+    bpf_map_update_elem(&incoming_trace_map, &sk_data->conn, tp_p, BPF_ANY);
 
     if (bpf_skb_change_head(skb, TP_SIZE, 0) != 0) {
         return SK_PASS;
@@ -1255,16 +1381,6 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
     bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_write_tp);
 
     return SK_PASS;
-
-    if (ptr + TP_SIZE > e) {
-        return SK_PASS;
-    }
-
-    make_tp_string_skb(ptr, &tp_p->tp, e);
-    //__builtin_memcpy((void *)ptr, TP, TP_SIZE);
-
-    bpf_printk("BUF = %s", ctx_data(skb));
-    return SK_PASS;
 }
 
 static __always_inline void tail_call_to_ingress_http_create_tp(struct __sk_buff *skb,
@@ -1290,7 +1406,8 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
     }
 
     const u64 cookie = bpf_get_socket_cookie(skb);
-    const struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
+
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
 
     if (!sk_data) {
         return SK_PASS;
@@ -1363,6 +1480,8 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
 
             bpf_map_update_elem(&incoming_trace_map, &sk_data->conn, tp_p, BPF_ANY);
 
+            sk_data->request.http.tp = tp_p->tp;
+
             return SK_PASS;
         }
 
@@ -1380,7 +1499,43 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
     return SK_PASS;
 }
 
-static __always_inline void handle_http_req(struct __sk_buff *skb) {
+static __always_inline void init_http_request(struct __sk_buff *skb, struct socket_data *sk_data) {
+    http_info_t *info = &sk_data->request.http;
+
+    const u64 curr_time = bpf_ktime_get_ns();
+
+    info->flags = EVENT_K_HTTP_REQUEST;
+    info->type = EVENT_HTTP_REQUEST;
+    info->ssl = 0;
+    info->delayed = 0;
+    info->conn_info = sk_data->conn;
+    info->start_monotime_ns = curr_time;
+    info->end_monotime_ns = curr_time;
+    info->req_monotime_ns = sk_data->accept_time;
+    info->extra_id = 0;
+    info->pid = sk_data->pid_info;
+    info->len = skb->len;
+    info->resp_len = 0;
+    info->task_tid = sk_data->task_tid;
+    info->status = 0;
+    info->has_large_buffers = 0;
+    info->direction = TCP_RECV;
+    info->submitted = 0;
+
+    const u32 len = skb->len;
+
+    if (len == 0) {
+        __builtin_memset(info->buf, 0, sizeof(info->buf));
+        return;
+    }
+
+    const u32 nbytes = len > sizeof(info->buf) ? sizeof(info->buf) : len;
+
+    //FIXME if we could avoid this, that'd be great
+    bpf_skb_load_bytes(skb, 0, info->buf, nbytes);
+}
+
+static __always_inline void handle_http_req(struct __sk_buff *skb, struct socket_data *sk_data) {
     bpf_skb_pull_data(skb, MIN_HTTP_REQ_SIZE);
 
     const unsigned char *b = ctx_data(skb);
@@ -1390,16 +1545,41 @@ static __always_inline void handle_http_req(struct __sk_buff *skb) {
         return;
     }
 
-    if (is_http_request_buf(b)) {
-        ingress_tailcall_ctx *t_ctx = ingress_tailcall_ctx_mem();
+    if (!is_http_request_buf(b)) {
+        return;
+    }
 
-        if (!t_ctx) {
-            return;
-        }
+    ingress_tailcall_ctx *t_ctx = ingress_tailcall_ctx_mem();
 
-        t_ctx->niter = 0;
+    if (!t_ctx) {
+        return;
+    }
 
-        bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_req);
+    t_ctx->niter = 0;
+
+    //FIXME check and flush previous request
+    init_http_request(skb, sk_data);
+
+    bpf_tail_call_static(skb, &ingress_jump_table, k_tail_ingress_http_req);
+}
+
+static __always_inline void handle_ongoing_http_req(struct __sk_buff *skb,
+                                                    struct socket_data *sk_data) {
+    http_info_t *req = &sk_data->request.http;
+
+    req->len += skb->len;
+    req->end_monotime_ns = bpf_ktime_get_ns();
+
+    // TODO ship large buffers
+}
+
+static __always_inline void handle_ongoing_req(struct __sk_buff *skb, struct socket_data *sk_data) {
+    switch (sk_data->request.flags) {
+    case EVENT_K_HTTP_REQUEST:
+        handle_ongoing_http_req(skb, sk_data);
+        break;
+    default:
+        break;
     }
 }
 
@@ -1409,7 +1589,7 @@ int obi_ingress_verdict(struct __sk_buff *skb) {
 
     bpf_printk("stream_verdict 0 cookie = %llu", cookie);
 
-    const struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
 
     bpf_printk("stream_verdict 1");
 
@@ -1427,7 +1607,12 @@ int obi_ingress_verdict(struct __sk_buff *skb) {
     bpf_printk("socket has pid: %u", (u32)sk_data->pid_tgid);
 
     bpf_printk("obi_ingress_verdict: %llu", cookie);
-    handle_http_req(skb);
+
+    if (sk_data->request.flags == 0) {
+        handle_http_req(skb, sk_data);
+    } else {
+        handle_ongoing_req(skb, sk_data);
+    }
 
     return SK_PASS;
 }
@@ -1447,7 +1632,7 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
         return 0;
     }
 
-    const u64 pid = id >> 32;
+    const u32 pid = id;
 
     bpf_dbg_printk("pid=%u, cookie=%llu, accepted_cookie=%llu", pid, cookie, accepted_cookie);
 
@@ -1459,6 +1644,9 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
     }
 
     data->pid_tgid = id;
+    data->accept_time = bpf_ktime_get_ns();
+    data->task_tid = get_task_tid();
+    task_pid(&data->pid_info);
 
     return 0;
 }

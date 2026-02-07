@@ -115,7 +115,7 @@ func (p *Tracer) SocketFilters() []*ebpf.Program {
 func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 	return []ebpfcommon.SockMsg{
 		{
-			Program:  p.bpfObjects.ObiPacketExtender,
+			Program:  p.bpfObjects.ObiEgressProg,
 			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
