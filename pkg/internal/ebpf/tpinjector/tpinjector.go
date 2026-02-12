@@ -24,6 +24,14 @@ import (
 
 //go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 Bpf ../../../../bpf/tpinjector/tpinjector.c -- -I../../../../bpf -I../../../../bpf
 
+func setConstant[T int32 | uint32](m map[string]any, name string, value bool) {
+	if value {
+		m[name] = T(1)
+	} else {
+		m[name] = T(0)
+	}
+}
+
 type Tracer struct {
 	cfg        *obi.Config
 	bpfObjects BpfObjects
@@ -58,11 +66,7 @@ func (p *Tracer) Constants() map[string]any {
 	// processes which we monitor. We filter more accurately in the userspace, but
 	// for performance reasons we enable the PID based filtering in eBPF.
 	// This must match httpfltr.go, otherwise we get partial events in userspace.
-	if p.cfg.Discovery.BPFPidFilterOff {
-		m["filter_pids"] = int32(0)
-	} else {
-		m["filter_pids"] = int32(1)
-	}
+	setConstant[int32](m, "filter_pids", !p.cfg.Discovery.BPFPidFilterOff)
 
 	m["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
 
@@ -76,6 +80,9 @@ func (p *Tracer) Constants() map[string]any {
 	}
 	m["inject_flags"] = flags
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+
+	setConstant[uint32](m, "high_request_volume", p.cfg.EBPF.HighRequestVolume)
+	setConstant[uint32](m, "track_request_headers", p.cfg.EBPF.TrackRequestHeaders)
 
 	return m
 }
@@ -115,12 +122,12 @@ func (p *Tracer) SocketFilters() []*ebpf.Program {
 func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 	return []ebpfcommon.SockMsg{
 		{
-			Program:  p.bpfObjects.ObiEgressProg,
+			Program:  p.bpfObjects.ObiSocketEgress,
 			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
 		{
-			Program:  p.bpfObjects.ObiIngressVerdict,
+			Program:  p.bpfObjects.ObiSocketIngress,
 			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkSKBStreamVerdict,
 		},
