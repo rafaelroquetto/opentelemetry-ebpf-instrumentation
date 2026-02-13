@@ -14,6 +14,7 @@ enum sk_type : u8 { sk_type_client, sk_type_server };
 
 struct socket_data {
     u64 pid_tgid;
+    u64 cookie;
     u64 accept_time;
 
     pid_info pid_info;
