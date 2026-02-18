@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "pid/types/pid_key.h"
 #include <bpfcore/vmlinux.h>
 
 #include <common/connection_info.h>
@@ -26,7 +27,10 @@ struct socket_data {
         http_info_t http;
     } request;
 
+    pid_key_t pid_key;
+
     connection_info_t conn;
+    connection_info_t sorted_conn;
 
     enum sk_type sk_type;
 

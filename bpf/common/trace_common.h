@@ -394,6 +394,8 @@ static __always_inline u8 find_trace_for_server_request(connection_info_t *conn,
 
 static __always_inline u8 should_be_in_same_transaction(const tp_info_t *parent_tp,
                                                         const tp_info_t *child_tp) {
+    return 1;
+    // XXX FIXME
     if (child_tp->ts < parent_tp->ts) {
         return 0;
     }

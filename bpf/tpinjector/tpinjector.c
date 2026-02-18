@@ -44,6 +44,78 @@ static const struct socket_data _sock_data_zero = {};
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
+static __always_inline u32 ctx_len(void *ctx) {
+    return ((struct __sk_buff *)ctx)->len;
+}
+
+static __always_inline void obi_pull_data(void *ctx, u32 len) {
+    bpf_skb_pull_data(ctx, len);
+}
+
+static __always_inline trace_key_t trace_key(const struct socket_data *sk_data) {
+    trace_key_t t_key = {};
+    t_key.p_key = sk_data->pid_key;
+    t_key.extra_id = extra_runtime_id();
+
+    return t_key;
+}
+
+static __always_inline pid_connection_info_t
+pid_connection_info(const struct socket_data *sk_data) {
+    const pid_connection_info_t p_conn = {.conn = sk_data->sorted_conn,
+                                          .pid = sk_data->pid_tgid >> 32};
+
+    return p_conn;
+}
+
+static __always_inline void set_server_trace(const struct socket_data *sk_data,
+                                             const tp_info_pid_t *tp_p) {
+    set_trace_info_for_connection(&sk_data->sorted_conn, TRACE_TYPE_SERVER, tp_p);
+
+    const u32 host_pid = sk_data->pid_tgid >> 32;
+
+    connection_info_part_t conn_part = {};
+
+    populate_ephemeral_info(
+        &conn_part, &sk_data->sorted_conn, sk_data->conn.d_port, host_pid, FD_SERVER);
+
+    bpf_dbg_printk("Saving connection server span for pid=%u, tid=%u, ephemeral_port=%u",
+                   sk_data->pid_key.pid,
+                   sk_data->pid_key.tid,
+                   conn_part.port);
+
+    bpf_map_update_elem(&server_traces_aux, &conn_part, tp_p, BPF_ANY);
+
+    const trace_key_t t_key = trace_key(sk_data);
+
+    tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
+
+    if (existing && existing->req_type == tp_p->req_type && tp_p->req_type == EVENT_HTTP_REQUEST) {
+        existing->valid = 0;
+        bpf_dbg_printk("Found conflicting thread server span, marking it invalid.");
+        return;
+    }
+
+    bpf_dbg_printk(
+        "Saving thread server span for ns=%u, extra_id=%llx", t_key.p_key.ns, t_key.extra_id);
+
+    bpf_map_update_elem(&server_traces, &t_key, tp_p, BPF_ANY);
+
+    obi_ctx__set(sk_data->pid_tgid, &tp_p->tp);
+}
+
+static __always_inline void set_client_trace(const struct socket_data *sk_data,
+                                             const tp_info_pid_t *tp_p) {
+    set_trace_info_for_connection(&sk_data->sorted_conn, TRACE_TYPE_CLIENT, tp_p);
+
+    const egress_key_t e_key = {
+        .d_port = sk_data->sorted_conn.d_port,
+        .s_port = sk_data->sorted_conn.s_port,
+    };
+
+    bpf_map_update_elem(&outgoing_trace_map, &e_key, tp_p, BPF_ANY);
+}
+
 // Flags to control what tpinjector should inject
 enum {
     k_inject_http_headers = 1 << 0, // Bit 0: inject HTTP headers
@@ -193,6 +265,7 @@ static __always_inline tp_info_pid_t *get_tp_info_pid(const egress_key_t *e_key)
     return bpf_map_lookup_elem(&outgoing_trace_map, e_key);
 }
 
+[[maybe_unused]]
 static __always_inline void set_tp_info_pid(const egress_key_t *e_key, const tp_info_pid_t *tp_p) {
     bpf_map_update_elem(&outgoing_trace_map, e_key, tp_p, BPF_ANY);
 }
@@ -354,9 +427,14 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
     data->pid_tgid = id;
     data->cookie = cookie;
     data->conn = get_connection_info_ops(skops);
+    data->sorted_conn = data->conn;
+
+    sort_connection_info(&data->sorted_conn);
+
     data->sk_type = sk_type_client;
     data->task_tid = get_task_tid();
     task_pid(&data->pid_info);
+    task_tid(&data->pid_key);
 
     struct sk_storage_data sk_data = {.sk_cookie = cookie};
 
@@ -402,6 +480,10 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
 
     data->cookie = cookie;
     data->conn = get_connection_info_ops(skops);
+    data->sorted_conn = data->conn;
+
+    sort_connection_info(&data->sorted_conn);
+
     data->sk_type = sk_type_server;
 
     bpf_map_update_elem(&sk_data_map, &cookie, data, BPF_ANY);
@@ -1367,7 +1449,7 @@ int obi_egress_http_req(struct sk_msg_md *msg) {
 
             print_tp("found TP in headers", &tp_p->tp);
 
-            set_tp_info_pid(&t_ctx->e_key, tp_p);
+            set_client_trace(sk_data, tp_p);
 
             sk_data->request.http.tp = tp_p->tp;
 
@@ -1417,28 +1499,35 @@ int obi_egress_http_create_tp(struct sk_msg_md *msg) {
         return SK_PASS;
     }
 
-#if 0
-    const tp_info_pid_t *parent_tp =
-        find_parent_trace_for_server_request(&sk_data->conn, &tp_p->tp);
-#else
-    const tp_info_pid_t *parent_tp = NULL;
-#endif
+    const pid_connection_info_t p_conn = pid_connection_info(sk_data);
 
-    if (parent_tp) {
-        __builtin_memcpy(tp_p->tp.trace_id, parent_tp->tp.trace_id, TRACE_ID_SIZE_BYTES);
-        __builtin_memcpy(tp_p->tp.parent_id, parent_tp->tp.span_id, SPAN_ID_SIZE_BYTES);
+    tp_info_t parent_tp = {};
+
+    const bool has_parent =
+        find_parent_trace_for_client_request(&p_conn, sk_data->conn.d_port, &parent_tp);
+
+    if (has_parent) {
+        __builtin_memcpy(tp_p->tp.trace_id, &parent_tp.trace_id, TRACE_ID_SIZE_BYTES);
+        __builtin_memcpy(tp_p->tp.parent_id, &parent_tp.span_id, SPAN_ID_SIZE_BYTES);
     } else {
         new_trace_id(&tp_p->tp);
         __builtin_memset(tp_p->tp.parent_id, 0, SPAN_ID_SIZE_BYTES);
     }
 
-    bpf_printk("ASSIGNED TP");
+    urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
+
+    tp_p->tp.ts = bpf_ktime_get_ns();
+    tp_p->tp.flags = 1;
+    tp_p->valid = 1;
+    tp_p->written = 1;
+    tp_p->pid = sk_data->pid_tgid >> 32;
+    tp_p->req_type = request_type(sk_data);
+
     sk_data->request.http.tp = tp_p->tp;
 
-    //tp_p->written = 1;
+    print_tp("created new TP", &tp_p->tp);
 
-    // associate this tp_info to this request
-    set_tp_info_pid(&t_ctx->e_key, tp_p);
+    set_client_trace(sk_data, tp_p);
 
     if (inject_flags & k_inject_tcp_options) {
         schedule_write_tcp_option(msg, tp_p);
@@ -1513,11 +1602,10 @@ find_parent_trace_for_server_request(const connection_info_t *conn, const tp_inf
     // TODO: really?
     parent_tp->valid = 0;
 
-    //FIXME - really required?
-    //set_trace_info_for_connection(conn, TRACE_TYPE_CLIENT, parent_tp);
     return parent_tp;
 }
 
+[[maybe_unused]]
 static __always_inline void assign_server_parent_tp(const connection_info_t *conn, tp_info_t *tp) {
     const tp_info_pid_t *parent_tp = find_parent_trace_for_server_request(conn, tp);
 
@@ -1597,7 +1685,7 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
     tp_p->req_type = EVENT_HTTP_REQUEST;
 
     const tp_info_pid_t *parent_tp =
-        find_parent_trace_for_server_request(&sk_data->conn, &tp_p->tp);
+        find_parent_trace_for_server_request(&sk_data->sorted_conn, &tp_p->tp);
 
     if (parent_tp) {
         __builtin_memcpy(tp_p->tp.trace_id, parent_tp->tp.trace_id, TRACE_ID_SIZE_BYTES);
@@ -1607,13 +1695,11 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
         __builtin_memset(tp_p->tp.parent_id, 0, SPAN_ID_SIZE_BYTES);
     }
 
-    assign_server_parent_tp(&sk_data->conn, &tp_p->tp);
-
     sk_data->request.http.tp = tp_p->tp;
 
     print_tp("created new TP", &tp_p->tp);
 
-    bpf_map_update_elem(&incoming_trace_map, &sk_data->conn, tp_p, BPF_ANY);
+    set_server_trace(sk_data, tp_p);
 
     //TODO: check config option and bail early if we shouldn't inject the TP
     if (bpf_skb_change_head(skb, TP_SIZE, 0) != 0) {
@@ -1621,7 +1707,8 @@ int obi_ingress_http_create_tp(struct __sk_buff *skb) {
     }
 
     //TODO: pull max len computed in previous tailcall
-    bpf_skb_pull_data(skb, skb->len);
+    obi_pull_data(skb, ctx_len(skb));
+    //bpf_skb_pull_data(skb, skb->len);
 
     unsigned char *ptr = ctx_data(skb);
     const unsigned char *e = ctx_data_end(skb);
@@ -1719,7 +1806,7 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
                 return SK_PASS;
             }
 
-            decode_hex(tp_p->tp.span_id, ptr, SPAN_ID_CHAR_LEN);
+            decode_hex(tp_p->tp.parent_id, ptr, SPAN_ID_CHAR_LEN);
 
             ptr += SPAN_ID_CHAR_LEN;
 
@@ -1745,13 +1832,13 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
             tp_p->pid = sk_data->pid_tgid >> 32;
             tp_p->req_type = request_type(sk_data);
 
-            assign_server_parent_tp(&sk_data->conn, &tp_p->tp);
+            urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
 
             print_tp("found TP in headers", &tp_p->tp);
 
-            bpf_map_update_elem(&incoming_trace_map, &sk_data->conn, tp_p, BPF_ANY);
-
             sk_data->request.http.tp = tp_p->tp;
+
+            set_server_trace(sk_data, tp_p);
 
             return SK_PASS;
         }
@@ -1975,6 +2062,7 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
     data->accept_time = bpf_ktime_get_ns();
     data->task_tid = get_task_tid();
     task_pid(&data->pid_info);
+    task_tid(&data->pid_key);
 
     return 0;
 }

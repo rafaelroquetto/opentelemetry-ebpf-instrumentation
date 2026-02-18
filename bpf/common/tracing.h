@@ -61,7 +61,7 @@ static __always_inline tp_info_pid_t *trace_info_for_connection(const connection
 }
 
 static __always_inline void
-set_trace_info_for_connection(connection_info_t *conn, u32 type, tp_info_pid_t *info) {
+set_trace_info_for_connection(const connection_info_t *conn, u32 type, const tp_info_pid_t *info) {
     trace_map_key_t key = {};
 
     // bpf_dbg_printk("setting trace info, type=%d", info->req_type);

@@ -203,6 +203,7 @@ http_get_or_create_trace_info(http_connection_metadata_t *meta,
 }
 
 static __always_inline u8 is_http(const unsigned char *p, u32 len, u8 *packet_type) {
+    return 0;
     if (len < MIN_HTTP_SIZE) {
         return 0;
     }
