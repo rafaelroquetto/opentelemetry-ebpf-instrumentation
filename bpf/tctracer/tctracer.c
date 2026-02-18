@@ -66,8 +66,8 @@ _Static_assert(sizeof(ipv6_opt) == 32, "invalid IPv6 option len");
 enum protocol { protocol_ip4, protocol_ip6, protocol_unknown };
 
 static __always_inline u16 ip_header_off(struct __sk_buff *ctx) {
-    void *data = ctx_data(ctx);
-    void *data_end = ctx_data_end(ctx);
+    void *data = ctx_skb_data(ctx);
+    void *data_end = ctx_skb_data_end(ctx);
 
     struct ethhdr *eth = data;
 
@@ -111,9 +111,9 @@ static __always_inline bool conn_info_from_skb4(struct __sk_buff *skb, connectio
         return false;
     }
 
-    const struct iphdr *iphdr = ctx_data(skb) + ip4_off;
+    const struct iphdr *iphdr = ctx_skb_data(skb) + ip4_off;
 
-    if ((const void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((const void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -133,7 +133,7 @@ static __always_inline bool conn_info_from_skb4(struct __sk_buff *skb, connectio
     const u16 ihl_bytes = iphdr->ihl << 2;
     const struct tcphdr *tcp = (struct tcphdr *)((const void *)iphdr + ihl_bytes);
 
-    if ((const void *)(tcp + 1) > ctx_data_end(skb)) {
+    if ((const void *)(tcp + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -150,9 +150,9 @@ static __always_inline bool conn_info_from_skb6(struct __sk_buff *skb, connectio
         return false;
     }
 
-    const struct ipv6hdr *iphdr = ctx_data(skb) + ip6_off;
+    const struct ipv6hdr *iphdr = ctx_skb_data(skb) + ip6_off;
 
-    if ((const void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((const void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -176,7 +176,7 @@ static __always_inline bool conn_info_from_skb6(struct __sk_buff *skb, connectio
 
         const struct ipv6_opt_hdr *opt_hdr = ptr;
 
-        if ((const void *)(opt_hdr + 1) > ctx_data_end(skb)) {
+        if ((const void *)(opt_hdr + 1) > ctx_skb_data_end(skb)) {
             return conn;
         }
 
@@ -203,7 +203,7 @@ static __always_inline bool conn_info_from_skb6(struct __sk_buff *skb, connectio
 
     const struct tcphdr *tcp = (struct tcphdr *)ptr;
 
-    if ((const void *)(tcp + 1) > ctx_data_end(skb)) {
+    if ((const void *)(tcp + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -276,9 +276,9 @@ static __always_inline bool parse_ip_options_ipv4(struct __sk_buff *skb, connect
         return 0;
     }
 
-    const struct iphdr *iphdr = ctx_data(skb) + ip4_off;
+    const struct iphdr *iphdr = ctx_skb_data(skb) + ip4_off;
 
-    if ((const void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((const void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -296,7 +296,7 @@ static __always_inline bool parse_ip_options_ipv4(struct __sk_buff *skb, connect
     }
 
     const unsigned char *ptr = (const unsigned char *)(iphdr + 1);
-    const unsigned char *end = ctx_data_end(skb);
+    const unsigned char *end = ctx_skb_data_end(skb);
 
     const u8 k_max_options = 10;
 
@@ -350,7 +350,7 @@ static __always_inline bool parse_ip_options_ipv4(struct __sk_buff *skb, connect
 
         const struct tcphdr *tcp = (struct tcphdr *)((const void *)iphdr + ihl_bytes);
 
-        if ((const void *)(tcp + 1) > ctx_data_end(skb)) {
+        if ((const void *)(tcp + 1) > ctx_skb_data_end(skb)) {
             return false;
         }
 
@@ -387,9 +387,9 @@ static __always_inline bool parse_ip_options_ipv6(struct __sk_buff *skb, connect
         return false;
     }
 
-    const struct ipv6hdr *iphdr = ctx_data(skb) + ip6_off;
+    const struct ipv6hdr *iphdr = ctx_skb_data(skb) + ip6_off;
 
-    if ((const void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((const void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -403,7 +403,7 @@ static __always_inline bool parse_ip_options_ipv6(struct __sk_buff *skb, connect
 
     const ipv6_opt *opt = (ipv6_opt *)(iphdr + 1);
 
-    if ((const void *)(opt + 1) > ctx_data_end(skb)) {
+    if ((const void *)(opt + 1) > ctx_skb_data_end(skb)) {
         return false;
     }
 
@@ -439,9 +439,9 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
         return;
     }
 
-    struct iphdr *iphdr = ctx_data(skb) + ip4_off;
+    struct iphdr *iphdr = ctx_skb_data(skb) + ip4_off;
 
-    if ((void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return;
     }
 
@@ -458,9 +458,9 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
     }
 
     // reload pointers
-    iphdr = ctx_data(skb) + ip4_off;
+    iphdr = ctx_skb_data(skb) + ip4_off;
 
-    if ((void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return;
     }
 
@@ -469,7 +469,7 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
     unsigned char *ptr = ((unsigned char *)iphdr) + ihl_bytes;
     unsigned char *ptr_b = ptr;
 
-    if ((void *)ptr + sizeof(ipv4_opt) > ctx_data_end(skb)) {
+    if ((void *)ptr + sizeof(ipv4_opt) > ctx_skb_data_end(skb)) {
         return;
     }
 
@@ -514,7 +514,7 @@ static __always_inline void inject_tc_ip_options_ipv4(struct __sk_buff *skb, tp_
 
     const struct tcphdr *tcp = (struct tcphdr *)ptr;
 
-    if ((const void *)(tcp + 1) > ctx_data_end(skb)) {
+    if ((const void *)(tcp + 1) > ctx_skb_data_end(skb)) {
         return;
     }
 
@@ -531,9 +531,9 @@ static __always_inline void inject_tc_ip_options_ipv6(struct __sk_buff *skb,
         return;
     }
 
-    struct ipv6hdr *iphdr = ctx_data(skb) + ip6_off;
+    struct ipv6hdr *iphdr = ctx_skb_data(skb) + ip6_off;
 
-    if ((void *)(iphdr + 1) > ctx_data_end(skb)) {
+    if ((void *)(iphdr + 1) > ctx_skb_data_end(skb)) {
         return;
     }
 
@@ -556,11 +556,11 @@ static __always_inline void inject_tc_ip_options_ipv6(struct __sk_buff *skb,
     }
 
     // reload pointers
-    iphdr = ctx_data(skb) + ip6_off;
+    iphdr = ctx_skb_data(skb) + ip6_off;
 
     ipv6_opt *opt = (ipv6_opt *)(iphdr + 1);
 
-    if ((void *)(opt + 1) > ctx_data_end(skb)) {
+    if ((void *)(opt + 1) > ctx_skb_data_end(skb)) {
         return;
     }
 

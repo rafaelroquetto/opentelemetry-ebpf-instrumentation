@@ -6,7 +6,9 @@
 package tpinjector // import "go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 
@@ -22,7 +24,9 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
 
-//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 Bpf ../../../../bpf/tpinjector/tpinjector.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiEgress ../../../../bpf/tpinjector/egress.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiIngress ../../../../bpf/tpinjector/ingress.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiSockOps ../../../../bpf/tpinjector/sockops.c -- -I../../../../bpf -I../../../../bpf
 
 func setConstant[T int32 | uint32](m map[string]any, name string, value bool) {
 	if value {
@@ -32,9 +36,31 @@ func setConstant[T int32 | uint32](m map[string]any, name string, value bool) {
 	}
 }
 
+type MergedObjects struct {
+	ObiEgressPrograms
+	ObiEgressMaps
+	ObiEgressVariables
+	ObiIngressPrograms
+	ObiIngressMaps
+	ObiIngressVariables
+	ObiSockOpsPrograms
+	ObiSockOpsMaps
+	ObiSockOpsVariables
+}
+
+func (o *MergedObjects) Close() error {
+	if err := _ObiEgressClose(&o.ObiEgressPrograms, &o.ObiEgressMaps); err != nil {
+		return err
+	}
+	if err := _ObiIngressClose(&o.ObiIngressPrograms, &o.ObiIngressMaps); err != nil {
+		return err
+	}
+	return _ObiSockOpsClose(&o.ObiSockOpsPrograms, &o.ObiSockOpsMaps)
+}
+
 type Tracer struct {
 	cfg        *obi.Config
-	bpfObjects BpfObjects
+	bpfObjects MergedObjects
 	closers    []io.Closer
 	log        *slog.Logger
 }
@@ -53,7 +79,73 @@ func (p *Tracer) AllowPID(app.PID, uint32, *svc.Attrs) {}
 func (p *Tracer) BlockPID(app.PID, uint32) {}
 
 func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
-	return LoadBpf()
+	var spec *ebpf.CollectionSpec
+	var err error
+
+	if err = mergeSpec(&spec, _ObiEgressBytes); err != nil {
+		return nil, err
+	}
+	if err = mergeSpec(&spec, _ObiIngressBytes); err != nil {
+		return nil, err
+	}
+	if err = mergeSpec(&spec, _ObiSockOpsBytes); err != nil {
+		return nil, err
+	}
+
+	return spec, nil
+}
+
+func mergeSpec(target **ebpf.CollectionSpec, objBytes []byte) error {
+	reader := bytes.NewReader(objBytes)
+	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
+	if err != nil {
+		return fmt.Errorf("failed to load spec: %w", err)
+	}
+
+	if *target == nil {
+		*target = spec
+		return nil
+	}
+
+	for name, mapSpec := range spec.Maps {
+		if existing, exists := (*target).Maps[name]; exists {
+			if !mapsCompatible(existing, mapSpec) {
+				return fmt.Errorf("incompatible map specs for shared map: %s", name)
+			}
+		} else {
+			(*target).Maps[name] = mapSpec
+		}
+	}
+
+	for name, progSpec := range spec.Programs {
+		if _, exists := (*target).Programs[name]; exists {
+			return fmt.Errorf("duplicate program name: %s", name)
+		}
+		(*target).Programs[name] = progSpec
+	}
+
+	for name, varSpec := range spec.Variables {
+		if existing, exists := (*target).Variables[name]; exists {
+			if !variablesCompatible(existing, varSpec) {
+				return fmt.Errorf("incompatible variable specs for shared variable: %s", name)
+			}
+		} else {
+			(*target).Variables[name] = varSpec
+		}
+	}
+
+	return nil
+}
+
+func mapsCompatible(a, b *ebpf.MapSpec) bool {
+	return a.Type == b.Type &&
+		a.KeySize == b.KeySize &&
+		a.ValueSize == b.ValueSize &&
+		a.MaxEntries == b.MaxEntries
+}
+
+func variablesCompatible(a, b *ebpf.VariableSpec) bool {
+	return a.Size() == b.Size()
 }
 
 func (p *Tracer) SetupTailCalls() {
@@ -123,12 +215,12 @@ func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 	return []ebpfcommon.SockMsg{
 		{
 			Program:  p.bpfObjects.ObiSocketEgress,
-			MapFD:    p.bpfObjects.SockDir.FD(),
+			MapFD:    p.bpfObjects.ObiEgressMaps.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
 		{
 			Program:  p.bpfObjects.ObiSocketIngress,
-			MapFD:    p.bpfObjects.SockDir.FD(),
+			MapFD:    p.bpfObjects.ObiEgressMaps.SockDir.FD(),
 			AttachAs: ebpf.AttachSkSKBStreamVerdict,
 		},
 	}
