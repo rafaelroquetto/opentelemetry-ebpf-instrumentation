@@ -215,12 +215,12 @@ func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 	return []ebpfcommon.SockMsg{
 		{
 			Program:  p.bpfObjects.ObiSocketEgress,
-			MapFD:    p.bpfObjects.ObiEgressMaps.SockDir.FD(),
+			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
 		{
 			Program:  p.bpfObjects.ObiSocketIngress,
-			MapFD:    p.bpfObjects.ObiEgressMaps.SockDir.FD(),
+			MapFD:    p.bpfObjects.SockDir.FD(),
 			AttachAs: ebpf.AttachSkSKBStreamVerdict,
 		},
 	}

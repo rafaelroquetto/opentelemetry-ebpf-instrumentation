@@ -6,21 +6,17 @@
 #include <bpfcore/bpf_endian.h>
 
 #include <common/connection_info.h>
-#include <common/http_info.h>
-#include <common/http_types.h>
-#include <common/protocol_defs.h>
 #include <common/scratch_mem.h>
 #include <common/tp_info.h>
-#include <common/trace_common.h>
 #include <common/trace_util.h>
-#include <common/tracing.h>
 
 #include <logger/bpf_dbg.h>
 
 #include <maps/incoming_trace_map.h>
 #include <maps/sock_dir.h>
 
-#include <tpinjector/helpers.h>
+#include <pid/pid.h>
+
 #include <tpinjector/http_core.h>
 #include <tpinjector/maps/sk_data_map.h>
 #include <tpinjector/maps/sk_storage_map.h>

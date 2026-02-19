@@ -4,32 +4,25 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_endian.h>
-#include <bpfcore/bpf_tracing.h>
 
 #include <common/connection_info.h>
 #include <common/egress_key.h>
 #include <common/http_buf_size.h>
-#include <common/http_info.h>
 #include <common/http_types.h>
 #include <common/msg_buffer.h>
 #include <common/protocol_defs.h>
-#include <common/scratch_mem.h>
 #include <common/ssl_helpers.h>
-#include <common/tc_common.h>
 #include <common/tp_info.h>
 #include <common/trace_common.h>
-#include <common/trace_util.h>
 #include <common/tracing.h>
 
 #include <generictracer/protocol_http.h>
-#include <generictracer/protocol_tcp.h>
 #include <generictracer/protocol_http2.h>
+#include <generictracer/protocol_tcp.h>
 
 #include <logger/bpf_dbg.h>
 
-#include <maps/incoming_trace_map.h>
 #include <maps/msg_buffers.h>
-#include <maps/sock_dir.h>
 
 #include <tpinjector/common_defs.h>
 #include <tpinjector/helpers.h>
@@ -93,11 +86,6 @@ enum {
 
 volatile const u32 inject_flags =
     k_inject_http_headers | k_inject_tcp_options; // default: both enabled
-
-// TCP option kind for OpenTelemetry context propagation
-// Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
-// Better than experimental options (253-254) which must not be shipped as defaults
-enum { k_tcp_option_kind_otel = 25 };
 
 enum {
     k_tail_packet_extender,
@@ -334,74 +322,6 @@ static __always_inline connection_info_t get_connection_info(struct sk_msg_md *m
 
 // this "beauty" ensures we hold pkt in the same register being range
 // validated
-static __always_inline unsigned char *
-check_pkt_access(unsigned char *buf, //NOLINT(readability-non-const-parameter)
-                 u32 offset,
-                 const unsigned char *end) {
-    unsigned char *ret;
-
-    asm goto("r4 = %[buf]\n"
-             "r4 += %[offset]\n"
-             "if r4 > %[end] goto %l[error]\n"
-             "%[ret] = %[buf]"
-             : [ret] "=r"(ret)
-             : [buf] "r"(buf), [end] "r"(end), [offset] "i"(offset)
-             : "r4"
-             : error);
-
-    return ret;
-error:
-    return NULL;
-}
-
-static __always_inline void
-make_tp_string_skb(unsigned char *buf, const tp_info_t *tp, const unsigned char *end) {
-    buf = check_pkt_access(buf, TP_SIZE, end);
-
-    if (!buf) {
-        return;
-    }
-
-    const __attribute__((unused)) unsigned char *tp_string = buf;
-
-    *buf++ = 'T';
-    *buf++ = 'r';
-    *buf++ = 'a';
-    *buf++ = 'c';
-    *buf++ = 'e';
-    *buf++ = 'p';
-    *buf++ = 'a';
-    *buf++ = 'r';
-    *buf++ = 'e';
-    *buf++ = 'n';
-    *buf++ = 't';
-    *buf++ = ':';
-    *buf++ = ' ';
-
-    // Version
-    *buf++ = '0';
-    *buf++ = '0';
-    *buf++ = '-';
-
-    // Trace ID
-    encode_hex(buf, tp->trace_id, TRACE_ID_SIZE_BYTES);
-    buf += TRACE_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    // SpanID
-    encode_hex(buf, tp->span_id, SPAN_ID_SIZE_BYTES);
-    buf += SPAN_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    *buf++ = '0';
-    *buf++ = (tp->flags == 0) ? '0' : '1';
-    *buf++ = '\r';
-    *buf++ = '\n';
-
-    bpf_dbg_printk("tp_string=%s", tp_string);
-}
 
 static __always_inline bool
 extend_and_write_tp(struct sk_msg_md *msg, u32 offset, const tp_info_t *tp) {

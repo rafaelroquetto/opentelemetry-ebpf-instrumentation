@@ -3,19 +3,12 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
-#include <bpfcore/bpf_endian.h>
 #include <bpfcore/bpf_tracing.h>
 
 #include <common/connection_info.h>
-#include <common/http_buf_size.h>
-#include <common/http_info.h>
-#include <common/http_types.h>
-#include <common/protocol_defs.h>
 #include <common/scratch_mem.h>
-#include <common/tc_common.h>
 #include <common/tp_info.h>
 #include <common/trace_common.h>
-#include <common/trace_util.h>
 #include <common/tracing.h>
 
 #include <logger/bpf_dbg.h>
@@ -103,74 +96,6 @@ static __always_inline void set_trace(const struct socket_data *sk_data,
 
 // this "beauty" ensures we hold pkt in the same register being range
 // validated
-static __always_inline unsigned char *
-check_pkt_access(unsigned char *buf, //NOLINT(readability-non-const-parameter)
-                 u32 offset,
-                 const unsigned char *end) {
-    unsigned char *ret;
-
-    asm goto("r4 = %[buf]\n"
-             "r4 += %[offset]\n"
-             "if r4 > %[end] goto %l[error]\n"
-             "%[ret] = %[buf]"
-             : [ret] "=r"(ret)
-             : [buf] "r"(buf), [end] "r"(end), [offset] "i"(offset)
-             : "r4"
-             : error);
-
-    return ret;
-error:
-    return NULL;
-}
-
-static __always_inline void
-make_tp_string_skb(unsigned char *buf, const tp_info_t *tp, const unsigned char *end) {
-    buf = check_pkt_access(buf, TP_SIZE, end);
-
-    if (!buf) {
-        return;
-    }
-
-    const __attribute__((unused)) unsigned char *tp_string = buf;
-
-    *buf++ = 'T';
-    *buf++ = 'r';
-    *buf++ = 'a';
-    *buf++ = 'c';
-    *buf++ = 'e';
-    *buf++ = 'p';
-    *buf++ = 'a';
-    *buf++ = 'r';
-    *buf++ = 'e';
-    *buf++ = 'n';
-    *buf++ = 't';
-    *buf++ = ':';
-    *buf++ = ' ';
-
-    // Version
-    *buf++ = '0';
-    *buf++ = '0';
-    *buf++ = '-';
-
-    // Trace ID
-    encode_hex(buf, tp->trace_id, TRACE_ID_SIZE_BYTES);
-    buf += TRACE_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    // SpanID
-    encode_hex(buf, tp->span_id, SPAN_ID_SIZE_BYTES);
-    buf += SPAN_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    *buf++ = '0';
-    *buf++ = (tp->flags == 0) ? '0' : '1';
-    *buf++ = '\r';
-    *buf++ = '\n';
-
-    bpf_dbg_printk("tp_string=%s", tp_string);
-}
 
 // ----- ingress programs
 
