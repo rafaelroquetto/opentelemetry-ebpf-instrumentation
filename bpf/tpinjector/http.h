@@ -11,18 +11,18 @@
 
 #include <tpinjector/common_defs.h>
 #include <tpinjector/http_core.h>
+#include <tpinjector/maps/sk_data_map.h>
 #include <tpinjector/socket_data.h>
 #include <tpinjector/tailcall_ctx.h>
 
 volatile const u32 high_request_volume = 0;
 
-static __always_inline void
-init_http_request(void *ctx, struct socket_data *sk_data, u8 direction) {
+static __always_inline void init_http_request(void *ctx, struct socket_data *sk_data) {
     bpf_dbg_enter();
 
     const u32 len = ctx_len(ctx);
 
-    init_http_request_common(sk_data, len, direction);
+    init_http_request_common(sk_data, len);
 
     http_info_t *info = &sk_data->request.http;
 
@@ -90,7 +90,7 @@ static __always_inline bool handle_http_req(void *ctx, struct socket_data *sk_da
     t_ctx->sock_cookie = sk_data->cookie;
     t_ctx->niter = 0;
 
-    init_http_request(ctx, sk_data, TCP_SEND);
+    init_http_request(ctx, sk_data);
 
     bpf_tail_call_static(ctx, prog_map(), tail_http_req());
 
@@ -156,4 +156,170 @@ static __always_inline void handle_http_res(void *ctx, struct socket_data *data)
     if (high_request_volume || data->sk_type == sk_type_client) {
         finish_http_req(data);
     }
+}
+
+static __always_inline int http_find_tp(void *ctx) {
+    bpf_dbg_enter();
+
+    const u32 k_max_iter = 4; // iterate up to 4KB
+
+    tailcall_ctx *t_ctx = tailcall_ctx_mem();
+
+    if (!t_ctx) {
+        return SK_PASS;
+    }
+
+    tp_info_pid_t *tp_p = tp_buf();
+
+    if (!tp_p) {
+        return SK_PASS;
+    }
+
+    const u64 cookie = t_ctx->sock_cookie;
+
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
+
+    if (!sk_data) {
+        return SK_PASS;
+    }
+
+    const u32 niter = t_ctx->niter;
+
+    if (niter >= k_max_iter) {
+        return SK_PASS;
+    }
+
+    unsigned char *b = ctx_data(ctx);
+    const unsigned char *e = ctx_data_end(ctx);
+    unsigned char *ptr = b + (niter * 1024);
+
+    if (ptr >= e) {
+        return SK_PASS;
+    }
+
+    bpf_dbg_printk("looking for traceparent header (iter=%u)", niter);
+
+    const u32 data_size = (e - ptr) & 0x3ff; // 1KB chunks per iteration
+
+    for (u32 i = 0; i < data_size; ++i) {
+        if (ptr + TP_SIZE >= e || is_eoh(ptr)) {
+            t_ctx->niter = 0;
+            bpf_tail_call_static(ctx, prog_map(), tail_http_create_tp());
+            break;
+        }
+
+        if (is_traceparent(ptr)) {
+            ptr += TP_TID_PREFIX_SIZE;
+
+            decode_hex(tp_p->tp.trace_id, ptr, TRACE_ID_CHAR_LEN);
+
+            ptr += TRACE_ID_CHAR_LEN;
+
+            if (*ptr++ != '-') {
+                return SK_PASS;
+            }
+
+            unsigned char *dest = tp_span_id_field(&tp_p->tp);
+
+            decode_hex(dest, ptr, SPAN_ID_CHAR_LEN);
+
+            unsigned char *span_id = ptr;
+
+            ptr += SPAN_ID_CHAR_LEN;
+
+            if (*ptr++ != '-') {
+                return SK_PASS;
+            }
+
+            decode_hex((unsigned char *)&tp_p->tp.flags, ptr, FLAGS_CHAR_LEN);
+
+            ptr += FLAGS_CHAR_LEN;
+
+            if (*ptr++ != '\r' || *ptr != '\n') {
+                return SK_PASS;
+            }
+
+            // if we got to this point, we managed to parse a valid
+            // 'Traceparent: ...' header that we can utilise
+
+            init_span_id(t_ctx, &tp_p->tp, span_id);
+
+            tp_p->tp.ts = bpf_ktime_get_ns();
+            tp_p->tp.flags = 1;
+            tp_p->valid = 1;
+            tp_p->written = 1;
+            tp_p->pid = sk_data->pid_tgid >> 32;
+            tp_p->req_type = request_type(sk_data);
+
+            print_tp("found TP in headers", &tp_p->tp);
+
+            set_trace(sk_data, tp_p);
+
+            sk_data->request.http.tp = tp_p->tp;
+
+            schedule_write_tcp_option(ctx, tp_p);
+
+            return SK_PASS;
+        }
+
+        ++ptr;
+    }
+
+    t_ctx->niter++;
+
+    if (t_ctx->niter < k_max_iter) {
+        bpf_tail_call_static(ctx, prog_map(), tail_http_req());
+    } else {
+        t_ctx->niter = 0;
+        bpf_tail_call_static(ctx, prog_map(), tail_http_create_tp());
+    }
+
+    return SK_PASS;
+}
+
+static __always_inline int http_create_tp(void *ctx) {
+    bpf_dbg_enter();
+
+    tailcall_ctx *t_ctx = tailcall_ctx_mem();
+
+    if (!t_ctx) {
+        return SK_PASS;
+    }
+
+    const u64 cookie = t_ctx->sock_cookie;
+
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
+
+    if (!sk_data) {
+        return SK_PASS;
+    }
+
+    tp_info_pid_t *tp_p = tp_buf();
+
+    if (!tp_p) {
+        return SK_PASS;
+    }
+
+    init_tp(sk_data, &tp_p->tp);
+
+    urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
+
+    tp_p->tp.ts = bpf_ktime_get_ns();
+    tp_p->tp.flags = 1;
+    tp_p->valid = 1;
+    tp_p->written = 1;
+    tp_p->pid = sk_data->pid_tgid >> 32;
+    tp_p->req_type = request_type(sk_data);
+
+    sk_data->request.http.tp = tp_p->tp;
+
+    print_tp("created new TP", &tp_p->tp);
+
+    set_trace(sk_data, tp_p);
+
+    schedule_write_tcp_option(ctx, tp_p);
+
+    write_tp_http_header(ctx, t_ctx);
+
+    return SK_PASS;
 }

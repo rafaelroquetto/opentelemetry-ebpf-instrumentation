@@ -80,6 +80,11 @@ static __always_inline void set_client_trace(const struct socket_data *sk_data,
     bpf_map_update_elem(&outgoing_trace_map, &e_key, tp_p, BPF_ANY);
 }
 
+static __always_inline void set_trace(const struct socket_data *sk_data,
+                                      const tp_info_pid_t *tp_p) {
+    set_client_trace(sk_data, tp_p);
+}
+
 // Flags to control what tpinjector should inject
 enum {
     k_inject_http_headers = 1 << 0, // Bit 0: inject HTTP headers
@@ -127,6 +132,14 @@ static __always_inline void *prog_map() {
 
 static __always_inline u32 tail_http_req() {
     return k_tail_egress_http_req;
+}
+
+static __always_inline u32 tail_http_create_tp() {
+    return k_tail_egress_http_create_tp;
+}
+
+static __always_inline unsigned char *tp_span_id_field(tp_info_t *tp) {
+    return tp->span_id;
 }
 
 [[maybe_unused]]
@@ -438,7 +451,13 @@ static __always_inline bool write_msg_traceparent(struct sk_msg_md *msg, const t
     return extend_and_write_tp(msg, write_offset, tp);
 }
 
-static __always_inline void schedule_write_tcp_option(struct sk_msg_md *msg, tp_info_pid_t *tp_p) {
+static __always_inline void schedule_write_tcp_option(void *ctx, tp_info_pid_t *tp_p) {
+    if (!(inject_flags & k_inject_tcp_options)) {
+        return;
+    }
+
+    struct sk_msg_md *msg = (struct sk_msg_md *)ctx;
+
     struct bpf_sock *sk = msg->sk;
 
     if (!sk) {
@@ -480,9 +499,7 @@ static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
                                                    const connection_info_t *conn,
                                                    const egress_key_t *e_key,
                                                    tp_info_pid_t *tp_pid) {
-    if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_pid);
-    }
+    schedule_write_tcp_option(msg, tp_pid);
 
     // shortcut: if valid == 0, this is not a HTTP request (likely SSL, but
     // could be anything really - don't bother with protocol_detector)
@@ -519,7 +536,6 @@ static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct sock
     }
 
     // TODO: handle other protocols
-    //bpf_tail_call_static(msg, &obi_egress_progs, k_tail_packet_extender);
 }
 
 SEC("sk_msg")
@@ -681,7 +697,7 @@ int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg) {
 }
 
 static __always_inline void
-assign_client_parent_tp(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
+init_span_id(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
     if (!t_ctx->has_parent_tp) {
         return;
     }
@@ -718,145 +734,10 @@ SEC("sk_msg")
 int obi_egress_http_req(struct sk_msg_md *msg) {
     bpf_dbg_enter();
 
-    const u32 k_max_iter = 4; // iterate up to 4KB
-
-    tailcall_ctx *t_ctx = tailcall_ctx_mem();
-
-    if (!t_ctx) {
-        return SK_PASS;
-    }
-
-    tp_info_pid_t *tp_p = tp_buf();
-
-    if (!tp_p) {
-        return SK_PASS;
-    }
-
-    const u64 cookie = t_ctx->sock_cookie;
-
-    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
-
-    if (!sk_data) {
-        return SK_PASS;
-    }
-
-    const u32 niter = t_ctx->niter;
-
-    if (niter >= k_max_iter) {
-        return SK_PASS;
-    }
-
-    unsigned char *b = msg->data;
-    const unsigned char *e = msg->data_end;
-    unsigned char *ptr = b + (niter * 1024);
-
-    if (ptr >= e) {
-        return SK_PASS;
-    }
-
-    bpf_dbg_printk("looking for traceparent header (iter=%u)", niter);
-
-    const u32 data_size = (e - ptr) & 0x3ff; // 1KB chunks per iteration
-
-    for (u32 i = 0; i < data_size; ++i) {
-        if (ptr + TP_SIZE >= e || is_eoh(ptr)) {
-            bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_create_tp);
-            break;
-        }
-
-        if (is_traceparent(ptr)) {
-            ptr += TP_TID_PREFIX_SIZE;
-
-            decode_hex(tp_p->tp.trace_id, ptr, TRACE_ID_CHAR_LEN);
-
-            ptr += TRACE_ID_CHAR_LEN;
-
-            if (*ptr++ != '-') {
-                return SK_PASS;
-            }
-
-            decode_hex(tp_p->tp.span_id, ptr, SPAN_ID_CHAR_LEN);
-
-            unsigned char *span_id = ptr;
-
-            ptr += SPAN_ID_CHAR_LEN;
-
-            if (*ptr++ != '-') {
-                return SK_PASS;
-            }
-
-            decode_hex((unsigned char *)&tp_p->tp.flags, ptr, FLAGS_CHAR_LEN);
-
-            ptr += FLAGS_CHAR_LEN;
-
-            if (*ptr++ != '\r' || *ptr != '\n') {
-                return SK_PASS;
-            }
-
-            // if we got to this point, we managed to parse a valid
-            // 'Traceparent: ...' header that we can utilise
-
-            assign_client_parent_tp(t_ctx, &tp_p->tp, span_id);
-
-            tp_p->tp.ts = bpf_ktime_get_ns();
-            tp_p->tp.flags = 1;
-            tp_p->valid = 1;
-            tp_p->written = 1;
-            tp_p->pid = sk_data->pid_tgid >> 32;
-            tp_p->req_type = request_type(sk_data);
-
-            print_tp("found TP in headers", &tp_p->tp);
-
-            set_client_trace(sk_data, tp_p);
-
-            sk_data->request.http.tp = tp_p->tp;
-
-            if (inject_flags & k_inject_tcp_options) {
-                schedule_write_tcp_option(msg, tp_p);
-            }
-
-            return SK_PASS;
-        }
-
-        ++ptr;
-    }
-
-    t_ctx->niter++;
-
-    if (t_ctx->niter < k_max_iter) {
-        bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_req);
-    } else {
-        bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_create_tp);
-    }
-
-    return SK_PASS;
+    return http_find_tp(msg);
 }
 
-//k_tail_egress_http_create_tp
-SEC("sk_msg")
-int obi_egress_http_create_tp(struct sk_msg_md *msg) {
-    bpf_dbg_enter();
-
-    tailcall_ctx *t_ctx = tailcall_ctx_mem();
-
-    if (!t_ctx) {
-        return SK_PASS;
-    }
-
-    const u64 cookie = t_ctx->sock_cookie;
-
-    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
-
-    if (!sk_data) {
-        return SK_PASS;
-    }
-
-    tp_info_pid_t *tp_p = tp_buf();
-
-    if (!tp_p) {
-        return SK_PASS;
-    }
-
+static __always_inline void init_tp(struct socket_data *sk_data, tp_info_t *tp) {
     const pid_connection_info_t p_conn = pid_connection_info(sk_data);
 
     tp_info_t parent_tp = {};
@@ -865,37 +746,30 @@ int obi_egress_http_create_tp(struct sk_msg_md *msg) {
         find_parent_trace_for_client_request(&p_conn, sk_data->conn.d_port, &parent_tp);
 
     if (has_parent) {
-        __builtin_memcpy(tp_p->tp.trace_id, &parent_tp.trace_id, TRACE_ID_SIZE_BYTES);
-        __builtin_memcpy(tp_p->tp.parent_id, &parent_tp.span_id, SPAN_ID_SIZE_BYTES);
+        __builtin_memcpy(tp->trace_id, &parent_tp.trace_id, TRACE_ID_SIZE_BYTES);
+        __builtin_memcpy(tp->parent_id, &parent_tp.span_id, SPAN_ID_SIZE_BYTES);
     } else {
-        new_trace_id(&tp_p->tp);
-        __builtin_memset(tp_p->tp.parent_id, 0, SPAN_ID_SIZE_BYTES);
+        new_trace_id(tp);
+        __builtin_memset(tp->parent_id, 0, SPAN_ID_SIZE_BYTES);
+    }
+}
+
+static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx) {
+    (void)t_ctx;
+
+    if (!(inject_flags & k_inject_http_headers)) {
+        return;
     }
 
-    urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
+    // write the HTTP headers
+    bpf_tail_call_static(ctx, &obi_egress_progs, k_tail_write_msg_traceparent);
+    bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
+}
 
-    tp_p->tp.ts = bpf_ktime_get_ns();
-    tp_p->tp.flags = 1;
-    tp_p->valid = 1;
-    tp_p->written = 1;
-    tp_p->pid = sk_data->pid_tgid >> 32;
-    tp_p->req_type = request_type(sk_data);
+//k_tail_egress_http_create_tp
+SEC("sk_msg")
+int obi_egress_http_create_tp(struct sk_msg_md *msg) {
+    bpf_dbg_enter();
 
-    sk_data->request.http.tp = tp_p->tp;
-
-    print_tp("created new TP", &tp_p->tp);
-
-    set_client_trace(sk_data, tp_p);
-
-    if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_p);
-    }
-
-    if (inject_flags & k_inject_http_headers) {
-        // write the HTTP headers
-        bpf_tail_call_static(msg, &obi_egress_progs, k_tail_write_msg_traceparent);
-        bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
-    }
-
-    return SK_PASS;
+    return http_create_tp(msg);
 }

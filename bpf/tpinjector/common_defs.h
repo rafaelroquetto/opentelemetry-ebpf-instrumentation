@@ -6,6 +6,9 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 
+#include <tpinjector/socket_data.h>
+#include <tpinjector/tailcall_ctx.h>
+
 static __always_inline u32 ctx_len(void *ctx);
 static __always_inline void ctx_pull_data(void *ctx, u32 len);
 static __always_inline void *ctx_data(void *ctx);
@@ -14,3 +17,16 @@ static __always_inline void *ctx_data_end(void *ctx);
 static __always_inline void *prog_map();
 
 static __always_inline u32 tail_http_req();
+static __always_inline u32 tail_http_create_tp();
+
+static __always_inline void set_trace(const struct socket_data *sk_data, const tp_info_pid_t *tp_p);
+
+static __always_inline void schedule_write_tcp_option(void *ctx, tp_info_pid_t *tp_p);
+
+static __always_inline unsigned char *tp_span_id_field(tp_info_t *tp);
+
+static __always_inline void
+init_span_id(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id);
+
+static __always_inline void init_tp(struct socket_data *sk_data, tp_info_t *tp);
+static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx);

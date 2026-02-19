@@ -51,14 +51,17 @@ static __always_inline bool handle_pending_http_req(struct socket_data *sk_data,
     return false;
 }
 
-static __always_inline void
-init_http_request_common(struct socket_data *sk_data, u32 len, u8 direction) {
-    http_info_t *info = &sk_data->request.http;
-
+static __always_inline void init_http_request_common(struct socket_data *sk_data, u32 len) {
     const u64 curr_time = bpf_ktime_get_ns();
 
+    const enum sk_type sk_type = sk_data->sk_type;
+
+    const u8 direction = sk_type == sk_type_client ? TCP_SEND : TCP_RECV;
+
+    http_info_t *info = &sk_data->request.http;
+
     info->flags = EVENT_K_HTTP_REQUEST;
-    info->type = direction == TCP_RECV ? EVENT_HTTP_REQUEST : EVENT_HTTP_CLIENT;
+    info->type = request_type(sk_data);
     info->ssl = 0;
     info->delayed = 0;
     info->conn_info = sk_data->conn;

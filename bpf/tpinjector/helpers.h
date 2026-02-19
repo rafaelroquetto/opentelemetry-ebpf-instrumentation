@@ -5,6 +5,7 @@
 
 #include <bpfcore/vmlinux.h>
 
+#include <common/ringbuf.h>
 #include <common/tp_info.h>
 #include <common/tracing.h>
 
