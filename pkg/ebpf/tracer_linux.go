@@ -173,18 +173,6 @@ func (pt *ProcessTracer) Run(ctx context.Context, ebpfEventContext *common.EBPFE
 	}
 }
 
-func (pt *ProcessTracer) loadSpec(p Tracer) (*ebpf.CollectionSpec, error) {
-	spec, err := p.Load()
-	if err != nil {
-		return nil, fmt.Errorf("loading eBPF program: %w", err)
-	}
-	if err := ebpfconvenience.RewriteConstants(spec, p.Constants()); err != nil {
-		return nil, fmt.Errorf("rewriting BPF constants definition: %w", err)
-	}
-
-	return spec, nil
-}
-
 func (pt *ProcessTracer) makeOtelBPFFSPath() (string, error) {
 	otelPath := path.Join(pt.bpffsPath, "otel")
 
@@ -195,43 +183,66 @@ func (pt *ProcessTracer) makeOtelBPFFSPath() (string, error) {
 	return otelPath, nil
 }
 
-func (pt *ProcessTracer) setupBPFFS(spec *ebpf.CollectionSpec) string {
-	otelBPFFSPath, err := pt.makeOtelBPFFSPath()
-
-	if err == nil {
-		return otelBPFFSPath
+func (pt *ProcessTracer) loadAndAssign(eventContext *common.EBPFEventContext, p Tracer) error {
+	// Load one or more specs from the tracer
+	specs, err := p.LoadSpecs()
+	if err != nil {
+		return fmt.Errorf("loading eBPF program specs: %w", err)
 	}
 
-	slog.Warn("creating OTEL namespace in bpffs failed (is bpffs mounted?)", "bpffs_path", pt.bpffsPath, "err", err)
-	slog.Warn("OBI will still work, but features depending on pinned maps (e.g., log enricher, profile correlation) will be disabled")
+	// Set up BPF FS path once for all specs
+	otelBPFFSPath, err := pt.makeOtelBPFFSPath()
+	if err != nil {
+		slog.Warn("creating OTEL namespace in bpffs failed (is bpffs mounted?)",
+			"bpffs_path", pt.bpffsPath, "err", err)
+		slog.Warn("OBI will still work, but features depending on pinned maps (e.g., log enricher, profile correlation) will be disabled")
 
-	for _, v := range spec.Maps {
-		if v.Pinning == ebpf.PinByName {
-			v.Pinning = ebpf.PinNone
-			v.MaxEntries = 1
+		// Disable pinning for ALL specs
+		for _, spec := range specs {
+			for _, v := range spec.Maps {
+				if v.Pinning == ebpf.PinByName {
+					v.Pinning = ebpf.PinNone
+					v.MaxEntries = 1
+				}
+			}
+		}
+		otelBPFFSPath = ""
+	}
+
+	// Get the target objects and constants for each spec
+	objs := p.BpfObjects()
+	constants := p.Constants()
+	if len(objs) != len(specs) {
+		return fmt.Errorf("BpfObjects() returned %d objects but LoadSpecs() returned %d specs", len(objs), len(specs))
+	}
+	if len(constants) != len(specs) {
+		return fmt.Errorf("Constants() returned %d maps but LoadSpecs() returned %d specs", len(constants), len(specs))
+	}
+
+	// Load each spec into its corresponding object
+	for i, spec := range specs {
+		// Rewrite constants for this spec
+		if err := ebpfconvenience.RewriteConstants(spec, constants[i]); err != nil {
+			return fmt.Errorf("rewriting BPF constants for spec %d: %w", i, err)
+		}
+
+		// Resolve shared maps via MapReplacements
+		collOpts, err := resolveMaps(eventContext, spec)
+		if err != nil {
+			return fmt.Errorf("resolving maps for spec %d: %w", i, err)
+		}
+
+		// Set program and map options (same path for all specs)
+		collOpts.Programs = ebpf.ProgramOptions{LogSizeStart: 640 * 1024}
+		collOpts.Maps = ebpf.MapOptions{PinPath: otelBPFFSPath}
+
+		// LoadAndAssign populates fields in objs[i] using reflection
+		if err := spec.LoadAndAssign(objs[i], collOpts); err != nil {
+			return fmt.Errorf("loading spec %d: %w", i, err)
 		}
 	}
 
-	return ""
-}
-
-func (pt *ProcessTracer) loadAndAssign(eventContext *common.EBPFEventContext, p Tracer) error {
-	spec, err := pt.loadSpec(p)
-	if err != nil {
-		return err
-	}
-
-	collOpts, err := resolveMaps(eventContext, spec)
-	if err != nil {
-		return err
-	}
-
-	otelBPFFSPath := pt.setupBPFFS(spec)
-
-	collOpts.Programs = ebpf.ProgramOptions{LogSizeStart: 640 * 1024}
-	collOpts.Maps = ebpf.MapOptions{PinPath: otelBPFFSPath}
-
-	return spec.LoadAndAssign(p.BpfObjects(), collOpts)
+	return nil
 }
 
 func (pt *ProcessTracer) loadTracer(eventContext *common.EBPFEventContext, p Tracer, log *slog.Logger) error {
@@ -414,19 +425,26 @@ func RunUtilityTracer(ctx context.Context, eventContext *common.EBPFEventContext
 	i := instrumenter{}
 	plog := ptlog()
 	plog.Debug("loading independent eBPF program")
-	spec, err := p.Load()
+	specs, err := p.LoadSpecs()
 	if err != nil {
-		return fmt.Errorf("loading eBPF program: %w", err)
+		return fmt.Errorf("loading eBPF program specs: %w", err)
 	}
 
-	collOpts, err := resolveMaps(eventContext, spec)
-	if err != nil {
-		return err
+	objs := p.BpfObjects()
+	if len(objs) != len(specs) {
+		return fmt.Errorf("BpfObjects() returned %d objects but LoadSpecs() returned %d specs", len(objs), len(specs))
 	}
 
-	if err := spec.LoadAndAssign(p.BpfObjects(), collOpts); err != nil {
-		printVerifierErrorInfo(err)
-		return fmt.Errorf("loading and assigning BPF objects: %w", err)
+	for idx, spec := range specs {
+		collOpts, err := resolveMaps(eventContext, spec)
+		if err != nil {
+			return err
+		}
+
+		if err := spec.LoadAndAssign(objs[idx], collOpts); err != nil {
+			printVerifierErrorInfo(err)
+			return fmt.Errorf("loading and assigning BPF objects: %w", err)
+		}
 	}
 
 	if err := i.kprobes(p); err != nil {

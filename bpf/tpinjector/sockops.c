@@ -18,6 +18,7 @@
 #include <pid/pid.h>
 
 #include <tpinjector/http_core.h>
+#include <tpinjector/tcp_core.h>
 #include <tpinjector/maps/sk_data_map.h>
 #include <tpinjector/maps/sk_storage_map.h>
 #include <tpinjector/maps/sk_tp_info_pid_map.h>
@@ -34,8 +35,7 @@ enum {
     k_inject_tcp_options = 1 << 1,  // Bit 1: inject TCP options
 };
 
-volatile const u32 inject_flags =
-    k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+volatile const u32 inject_flags = k_inject_http_headers | k_inject_tcp_options;
 
 // TCP option kind for OpenTelemetry context propagation
 // Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
@@ -151,7 +151,7 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
-        bpf_printk("bpf_sock_ops_tcp_connect_cb: invalid pid");
+        bpf_dbg_printk("invalid pid: %u", id >> 32);
         return;
     }
 
@@ -199,9 +199,10 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
     bpf_dbg_enter();
 
     //FIXME merge with bpf_sock_ops_tcp_connect_cb
-    connection_info_t conn = get_connection_info_ops(skops);
+    const u64 cookie = bpf_get_socket_cookie(skops);
 
-    bpf_sock_hash_update(skops, &sock_dir, &conn, BPF_ANY);
+    bpf_dbg_printk("adding to sock_dir sock=%llu", cookie);
+    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_STATE_CB_FLAG);
 }
 
@@ -241,7 +242,8 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    bpf_sock_hash_update(skops, &sock_dir, &data->conn, BPF_ANY);
+    bpf_dbg_printk("adding to sock_dir sock=%llu", cookie);
+    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
     bpf_sock_ops_set_flags(skops,
                            BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_STATE_CB_FLAG);
 
@@ -381,6 +383,8 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
     case EVENT_K_HTTP_REQUEST:
         finish_http_req(sk_data);
         break;
+    case EVENT_TCP_REQUEST:
+        finish_tcp(sk_data);
     default:
         break;
     }

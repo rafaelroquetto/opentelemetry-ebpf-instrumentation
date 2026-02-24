@@ -14,12 +14,14 @@
 #include <logger/bpf_dbg.h>
 
 #include <maps/incoming_trace_map.h>
+#include <maps/sock_dir.h>
 
 #include <tpinjector/common_defs.h>
 #include <tpinjector/helpers.h>
 #include <tpinjector/http.h>
 #include <tpinjector/maps/sk_data_map.h>
 #include <tpinjector/socket_data.h>
+#include <tpinjector/tcp.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -73,6 +75,7 @@ static __always_inline void set_server_trace(const struct socket_data *sk_data,
 
     const trace_key_t t_key = trace_key(sk_data);
 
+#if 0
     tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
 
     if (existing && existing->req_type == tp_p->req_type && tp_p->req_type == EVENT_HTTP_REQUEST) {
@@ -80,6 +83,7 @@ static __always_inline void set_server_trace(const struct socket_data *sk_data,
         bpf_dbg_printk("Found conflicting thread server span, marking it invalid.");
         return;
     }
+#endif
 
     bpf_dbg_printk(
         "Saving thread server span for ns=%u, extra_id=%llx", t_key.p_key.ns, t_key.extra_id);
@@ -211,6 +215,9 @@ static __always_inline void init_tp(struct socket_data *sk_data, tp_info_t *tp) 
 }
 
 static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx) {
+#if 0
+    bpf_dbg_enter();
+
     struct __sk_buff *skb = (struct __sk_buff *)ctx;
 
     //TODO: check config option and bail early if we shouldn't inject the TP
@@ -220,12 +227,12 @@ static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx)
 
     //TODO: pull max len computed in previous tailcall
     ctx_pull_data(skb, ctx_len(skb));
-    //bpf_skb_pull_data(skb, skb->len);
 
     unsigned char *ptr = ctx_data(skb);
     const unsigned char *e = ctx_data_end(skb);
 
-    const u32 data_size = (e - ptr) & 0x3ff;
+    const u32 data_size = (e - ptr) & 0x1ff;
+    (void) data_size;
 
     for (u32 i = 0; i < data_size; ++i) {
         if (ptr + TP_SIZE + 1 >= e) {
@@ -234,8 +241,9 @@ static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx)
 
         *ptr = *(ptr + TP_SIZE);
 
-        if (*ptr == '\n')
+        if (*ptr == '\n') {
             break;
+        }
 
         ++ptr;
     }
@@ -244,7 +252,12 @@ static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx)
 
     t_ctx->tp_write_off = ((void *)ptr) - ctx_data(skb);
 
+    bpf_dbg_printk("after buf=%s", ptr);
+
     bpf_tail_call_static(skb, &obi_ingress_progs, k_tail_ingress_http_write_tp);
+
+    bpf_dbg_printk("TAILCALL FAILED");
+#endif
 }
 
 // k_tail_ingress_http_create_tp
@@ -278,6 +291,10 @@ static __always_inline void obi_server_ingress(struct __sk_buff *skb, struct soc
     }
 
     // TODO: handle other protocols
+
+    if (handle_tcp(skb, sk_data)) {
+        return;
+    }
 }
 
 static __always_inline void obi_client_ingress(struct __sk_buff *skb, struct socket_data *sk_data) {
@@ -295,6 +312,8 @@ int obi_socket_ingress(struct __sk_buff *skb) {
     if (!sk_data) {
         return SK_PASS;
     }
+
+    bpf_dbg_printk("cookie=%llu", cookie);
 
     switch (sk_data->sk_type) {
     case sk_type_server:
@@ -323,7 +342,7 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
         return 0;
     }
 
-    const u32 pid = id;
+    const u32 pid = id >> 32;
 
     bpf_dbg_printk("pid=%u, cookie=%llu, accepted_cookie=%llu", pid, cookie, accepted_cookie);
 

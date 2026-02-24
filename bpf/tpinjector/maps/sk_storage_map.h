@@ -6,6 +6,8 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 
+#include <common/pin_internal.h>
+
 #include <tpinjector/sk_storage_data.h>
 
 struct {
@@ -13,4 +15,5 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, u32);
     __type(value, struct sk_storage_data);
+    __uint(pinning, OBI_PIN_INTERNAL);
 } sk_storage_map SEC(".maps");

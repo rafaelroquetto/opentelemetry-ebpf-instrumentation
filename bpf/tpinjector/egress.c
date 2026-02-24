@@ -84,8 +84,7 @@ enum {
     k_inject_tcp_options = 1 << 1,  // Bit 1: inject TCP options
 };
 
-volatile const u32 inject_flags =
-    k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+volatile const u32 inject_flags = k_inject_http_headers | k_inject_tcp_options;
 
 enum {
     k_tail_packet_extender,
@@ -464,7 +463,6 @@ int obi_socket_egress(struct sk_msg_md *msg) {
         bpf_sk_storage_get(&sk_storage_map, msg->sk, NULL, 0);
 
     if (!sk_storage) {
-        bpf_printk("no sk data msg->sk = %llx", msg->sk);
         return SK_PASS;
     }
 
@@ -478,6 +476,8 @@ int obi_socket_egress(struct sk_msg_md *msg) {
         return SK_PASS;
     }
 
+    bpf_dbg_printk("cookie=%llu", sk_storage->sk_cookie);
+
     switch (sk_data->sk_type) {
     case sk_type_server:
         obi_server_egress(msg, sk_data);
@@ -487,6 +487,7 @@ int obi_socket_egress(struct sk_msg_md *msg) {
         break;
     }
 
+    bpf_dbg_printk("ret %s", ctx_data(msg));
     return SK_PASS;
 }
 

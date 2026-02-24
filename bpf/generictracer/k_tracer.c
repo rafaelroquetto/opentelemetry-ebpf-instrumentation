@@ -1217,7 +1217,7 @@ int obi_handle_buf_with_args(void *ctx) {
         } else if (!info) {
             // SSL requests will see both TCP traffic and text traffic, ignore the TCP if
             // we are processing SSL request. HTTP2 is already checked in handle_buf_with_connection.
-            bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+            //bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
         }
     }
 

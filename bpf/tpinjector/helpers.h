@@ -25,7 +25,7 @@ static __always_inline void print_tp(const char *msg, const tp_info_t *tp) {
     bpf_dbg_printk("%s: %s", msg, tp_buf_str);
 }
 
-static __always_inline u8 request_type(struct socket_data *sk_data) {
+static __always_inline u8 request_type(const struct socket_data *sk_data) {
     return sk_data->sk_type == sk_type_client ? EVENT_HTTP_CLIENT : EVENT_HTTP_REQUEST;
 }
 

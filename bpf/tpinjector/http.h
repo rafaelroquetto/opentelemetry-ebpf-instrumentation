@@ -5,7 +5,10 @@
 
 #include <bpfcore/vmlinux.h>
 
+#include <common/common.h>
 #include <common/http_info.h>
+#include <common/large_buffers.h>
+#include <common/trace_common.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -16,6 +19,128 @@
 #include <tpinjector/tailcall_ctx.h>
 
 volatile const u32 high_request_volume = 0;
+
+enum : u8 { k_packet_type_request = 1, k_packet_type_response = 2 };
+
+static __always_inline u32 lb_payload_size(u32 size) {
+    const u32 payload_size = size > http_buffer_size ? http_buffer_size : size;
+
+    return payload_size > sizeof(void *) ? payload_size : sizeof(void *);
+}
+
+static __always_inline void
+send_http_large_buffer(void *ctx, struct socket_data *sk_data, u8 packet_type, u8 action) {
+    bpf_dbg_enter();
+
+    if (http_buffer_size == 0) {
+        return;
+    }
+
+    u32 remaining_len = ctx_len(ctx);
+
+    const u8 nbuffers = remaining_len / http_buffer_size + (remaining_len % http_buffer_size != 0);
+
+    http_info_t *info = &sk_data->request.http;
+
+    for (u8 i = 0; i < nbuffers; ++i) {
+        const u32 payload_size = lb_payload_size(remaining_len);
+        u32 total_size = (sizeof(tcp_large_buffer_t) + payload_size) & k_large_buf_max_size_mask;
+
+        if (total_size > 4096) {
+            return;
+        } else if (total_size > 2048) {
+            total_size = 4096;
+        } else if (total_size > 1024) {
+            total_size = 2048;
+        } else {
+            total_size = 1024;
+        }
+
+        tcp_large_buffer_t *buf = (tcp_large_buffer_t *)bpf_ringbuf_reserve(&events, total_size, 0);
+
+        if (!buf) {
+            return;
+        }
+
+        buf->type = EVENT_TCP_LARGE_BUFFER;
+        buf->packet_type = packet_type;
+        buf->direction = info->direction;
+        buf->conn_info = info->conn_info;
+        buf->action = action;
+        buf->tp = info->tp;
+
+        bpf_ringbuf_submit(buf, get_flags());
+
+        action = k_large_buf_action_append;
+
+#if 0
+        unsigned char *b = ctx_data(ctx);
+        const unsigned char *e = ctx_data_end(ctx);
+        unsigned char *ptr = b + (i * http_buffer_size);
+
+#endif
+        remaining_len -= payload_size;
+    }
+
+#if 0
+    tcp_large_buffer_t *large_buf = (tcp_large_buffer_t *) http_large_buffers_mem();
+
+    if (!large_buf) {
+        bpf_dbg_printk("failed to reserve space for HTTP large buffer");
+        return;
+    }
+
+    http_info_t *info = &sk_data->request.http;
+
+    large_buf->type = EVENT_TCP_LARGE_BUFFER;
+    large_buf->packet_type = packet_type;
+    large_buf->direction = info->direction;
+    large_buf->conn_info = info->conn_info;
+    large_buf->action = action;
+    large_buf->tp = info->tp;
+
+
+    if (len > http_buffer_size) {
+        len = http_buffer_size;
+        bpf_dbg_printk("WARN: buffer is full, truncating data");
+    }
+
+    large_buf->len = len;
+
+    ctx_pull_data(ctx, len);
+
+    const u32 niter = 0;
+
+    unsigned char *b = ctx_data(ctx);
+    const unsigned char *e = ctx_data_end(ctx);
+    unsigned char *ptr = b + (niter * 1024);
+
+    unsigned char *buf = large_buf->buf;
+    const u32 data_size = (e - ptr) & 0xfff; // 1KB chunks per iteration
+
+    for (u32 i = 0; i < data_size; ++i) {
+        if (ptr + 1 > e) {
+            return;
+        }
+
+        *buf++ = *ptr++;
+    }
+
+#if 0
+    bpf_probe_read(large_buf->buf, large_buf->len & k_large_buf_payload_max_size_mask, ctx_data(ctx));
+#endif
+
+    const u32 payload_size = large_buf->len > sizeof(void *) ? large_buf->len : sizeof(void *);
+    const u32 total_size = (sizeof(tcp_large_buffer_t) + payload_size) & k_large_buf_max_size_mask;;
+
+
+    bpf_dbg_printk("sending large buffer, size=%u", payload_size);
+
+    if (bpf_ringbuf_output(&events, large_buf, total_size, get_flags()) == 0) {
+        info->has_large_buffers = true;
+    }
+#endif
+}
 
 static __always_inline void init_http_request(void *ctx, struct socket_data *sk_data) {
     bpf_dbg_enter();
@@ -91,6 +216,8 @@ static __always_inline bool handle_http_req(void *ctx, struct socket_data *sk_da
     t_ctx->niter = 0;
 
     init_http_request(ctx, sk_data);
+
+    send_http_large_buffer(ctx, sk_data, k_packet_type_request, k_large_buf_action_init);
 
     bpf_tail_call_static(ctx, prog_map(), tail_http_req());
 
@@ -199,12 +326,15 @@ static __always_inline int http_find_tp(void *ctx) {
 
     bpf_dbg_printk("looking for traceparent header (iter=%u)", niter);
 
+    bpf_dbg_printk("buf=%s", b);
+
     const u32 data_size = (e - ptr) & 0x3ff; // 1KB chunks per iteration
 
     for (u32 i = 0; i < data_size; ++i) {
         if (ptr + TP_SIZE >= e || is_eoh(ptr)) {
             t_ctx->niter = 0;
             bpf_tail_call_static(ctx, prog_map(), tail_http_create_tp());
+            bpf_dbg_printk("TAILCALL FAILED");
             break;
         }
 
@@ -269,9 +399,11 @@ static __always_inline int http_find_tp(void *ctx) {
 
     if (t_ctx->niter < k_max_iter) {
         bpf_tail_call_static(ctx, prog_map(), tail_http_req());
+        bpf_dbg_printk("TAILCALL FAILED");
     } else {
         t_ctx->niter = 0;
         bpf_tail_call_static(ctx, prog_map(), tail_http_create_tp());
+        bpf_dbg_printk("TAILCALL FAILED");
     }
 
     return SK_PASS;

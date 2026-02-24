@@ -6,6 +6,8 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 
+#include <common/pin_internal.h>
+
 #include <tpinjector/socket_data.h>
 
 struct {
@@ -13,4 +15,5 @@ struct {
     __type(key, u64);
     __type(value, struct socket_data);
     __uint(max_entries, 10000);
+    __uint(pinning, OBI_PIN_INTERNAL);
 } sk_data_map SEC(".maps");

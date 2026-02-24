@@ -6,7 +6,6 @@
 package tpinjector // import "go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -24,9 +23,9 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
 
-//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiEgress ../../../../bpf/tpinjector/egress.c -- -I../../../../bpf -I../../../../bpf
-//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiIngress ../../../../bpf/tpinjector/ingress.c -- -I../../../../bpf -I../../../../bpf
-//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 ObiSockOps ../../../../bpf/tpinjector/sockops.c -- -I../../../../bpf -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 TpinjectorEgress ../../../../bpf/tpinjector/egress.c -- -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 TpinjectorIngress ../../../../bpf/tpinjector/ingress.c -- -I../../../../bpf
+//go:generate $BPF2GO -cc $BPF_CLANG -cflags $BPF_CFLAGS -target amd64,arm64 TpinjectorSockops ../../../../bpf/tpinjector/sockops.c -- -I../../../../bpf
 
 func setConstant[T int32 | uint32](m map[string]any, name string, value bool) {
 	if value {
@@ -36,33 +35,13 @@ func setConstant[T int32 | uint32](m map[string]any, name string, value bool) {
 	}
 }
 
-type MergedObjects struct {
-	ObiEgressPrograms
-	ObiEgressMaps
-	ObiEgressVariables
-	ObiIngressPrograms
-	ObiIngressMaps
-	ObiIngressVariables
-	ObiSockOpsPrograms
-	ObiSockOpsMaps
-	ObiSockOpsVariables
-}
-
-func (o *MergedObjects) Close() error {
-	if err := _ObiEgressClose(&o.ObiEgressPrograms, &o.ObiEgressMaps); err != nil {
-		return err
-	}
-	if err := _ObiIngressClose(&o.ObiIngressPrograms, &o.ObiIngressMaps); err != nil {
-		return err
-	}
-	return _ObiSockOpsClose(&o.ObiSockOpsPrograms, &o.ObiSockOpsMaps)
-}
-
 type Tracer struct {
-	cfg        *obi.Config
-	bpfObjects MergedObjects
-	closers    []io.Closer
-	log        *slog.Logger
+	cfg         *obi.Config
+	egressObjs  TpinjectorEgressObjects
+	ingressObjs TpinjectorIngressObjects
+	sockopsObjs TpinjectorSockopsObjects
+	closers     []io.Closer
+	log         *slog.Logger
 }
 
 func New(cfg *obi.Config) *Tracer {
@@ -78,113 +57,76 @@ func (p *Tracer) AllowPID(app.PID, uint32, *svc.Attrs) {}
 
 func (p *Tracer) BlockPID(app.PID, uint32) {}
 
-func (p *Tracer) Load() (*ebpf.CollectionSpec, error) {
-	var spec *ebpf.CollectionSpec
-	var err error
-
-	if err = mergeSpec(&spec, _ObiEgressBytes); err != nil {
-		return nil, err
-	}
-	if err = mergeSpec(&spec, _ObiIngressBytes); err != nil {
-		return nil, err
-	}
-	if err = mergeSpec(&spec, _ObiSockOpsBytes); err != nil {
-		return nil, err
-	}
-
-	return spec, nil
-}
-
-func mergeSpec(target **ebpf.CollectionSpec, objBytes []byte) error {
-	reader := bytes.NewReader(objBytes)
-	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
+func (p *Tracer) LoadSpecs() ([]*ebpf.CollectionSpec, error) {
+	egressSpec, err := LoadTpinjectorEgress()
 	if err != nil {
-		return fmt.Errorf("failed to load spec: %w", err)
+		return nil, fmt.Errorf("loading egress spec: %w", err)
 	}
 
-	if *target == nil {
-		*target = spec
-		return nil
+	ingressSpec, err := LoadTpinjectorIngress()
+	if err != nil {
+		return nil, fmt.Errorf("loading ingress spec: %w", err)
 	}
 
-	for name, mapSpec := range spec.Maps {
-		if existing, exists := (*target).Maps[name]; exists {
-			if !mapsCompatible(existing, mapSpec) {
-				return fmt.Errorf("incompatible map specs for shared map: %s", name)
-			}
-		} else {
-			(*target).Maps[name] = mapSpec
-		}
+	sockopsSpec, err := LoadTpinjectorSockops()
+	if err != nil {
+		return nil, fmt.Errorf("loading sockops spec: %w", err)
 	}
 
-	for name, progSpec := range spec.Programs {
-		if _, exists := (*target).Programs[name]; exists {
-			return fmt.Errorf("duplicate program name: %s", name)
-		}
-		(*target).Programs[name] = progSpec
-	}
-
-	for name, varSpec := range spec.Variables {
-		if existing, exists := (*target).Variables[name]; exists {
-			if !variablesCompatible(existing, varSpec) {
-				return fmt.Errorf("incompatible variable specs for shared variable: %s", name)
-			}
-		} else {
-			(*target).Variables[name] = varSpec
-		}
-	}
-
-	return nil
-}
-
-func mapsCompatible(a, b *ebpf.MapSpec) bool {
-	return a.Type == b.Type &&
-		a.KeySize == b.KeySize &&
-		a.ValueSize == b.ValueSize &&
-		a.MaxEntries == b.MaxEntries
-}
-
-func variablesCompatible(a, b *ebpf.VariableSpec) bool {
-	return a.Size() == b.Size()
+	return []*ebpf.CollectionSpec{egressSpec, ingressSpec, sockopsSpec}, nil
 }
 
 func (p *Tracer) SetupTailCalls() {
 }
 
-func (p *Tracer) Constants() map[string]any {
-	m := make(map[string]any, 3)
-
-	// The eBPF side does some basic filtering of events that do not belong to
-	// processes which we monitor. We filter more accurately in the userspace, but
-	// for performance reasons we enable the PID based filtering in eBPF.
-	// This must match httpfltr.go, otherwise we get partial events in userspace.
-	setConstant[int32](m, "filter_pids", !p.cfg.Discovery.BPFPidFilterOff)
-
-	m["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
-
-	// Set injection flags based on context propagation configuration
-	flags := uint32(0)
-	if p.cfg.EBPF.ContextPropagation.HasHeaders() {
-		flags |= 1 // k_inject_http_headers
+func (p *Tracer) Constants() []map[string]any {
+	// Injection flags helper
+	injectFlags := func() uint32 {
+		flags := uint32(0)
+		if p.cfg.EBPF.ContextPropagation.HasHeaders() {
+			flags |= 1 // k_inject_http_headers
+		}
+		if p.cfg.EBPF.ContextPropagation.HasTCP() {
+			flags |= 2 // k_inject_tcp_options
+		}
+		return flags
 	}
-	if p.cfg.EBPF.ContextPropagation.HasTCP() {
-		flags |= 2 // k_inject_tcp_options
-	}
-	m["inject_flags"] = flags
-	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 
-	setConstant[uint32](m, "high_request_volume", p.cfg.EBPF.HighRequestVolume)
-	setConstant[uint32](m, "track_request_headers", p.cfg.EBPF.TrackRequestHeaders)
+	// Egress constants (spec 0)
+	// Has: inject_flags, track_request_headers, high_request_volume,
+	//      http_buffer_size, max_transaction_time, g_bpf_debug
+	egressConsts := make(map[string]any)
+	egressConsts["inject_flags"] = injectFlags()
+	setConstant[uint32](egressConsts, "track_request_headers", p.cfg.EBPF.TrackRequestHeaders)
+	setConstant[uint32](egressConsts, "high_request_volume", p.cfg.EBPF.HighRequestVolume)
+	egressConsts["http_buffer_size"] = p.cfg.EBPF.BufferSizes.HTTP
+	egressConsts["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
+	egressConsts["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 
-	return m
+	// Ingress constants (spec 1)
+	// Has: high_request_volume, http_buffer_size, max_transaction_time, g_bpf_debug
+	ingressConsts := make(map[string]any)
+	setConstant[uint32](ingressConsts, "high_request_volume", p.cfg.EBPF.HighRequestVolume)
+	ingressConsts["http_buffer_size"] = p.cfg.EBPF.BufferSizes.HTTP
+	ingressConsts["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
+	ingressConsts["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+
+	// Sockops constants (spec 2)
+	// Has: inject_flags, filter_pids, g_bpf_debug
+	sockopsConsts := make(map[string]any)
+	sockopsConsts["inject_flags"] = injectFlags()
+	setConstant[int32](sockopsConsts, "filter_pids", !p.cfg.Discovery.BPFPidFilterOff)
+	sockopsConsts["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+
+	return []map[string]any{egressConsts, ingressConsts, sockopsConsts}
 }
 
 func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
 
 func (p *Tracer) ProcessBinary(_ *exec.FileInfo) {}
 
-func (p *Tracer) BpfObjects() any {
-	return &p.bpfObjects
+func (p *Tracer) BpfObjects() []any {
+	return []any{&p.egressObjs, &p.ingressObjs, &p.sockopsObjs}
 }
 
 func (p *Tracer) AddCloser(c ...io.Closer) {
@@ -214,22 +156,23 @@ func (p *Tracer) SocketFilters() []*ebpf.Program {
 func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 	return []ebpfcommon.SockMsg{
 		{
-			Program:  p.bpfObjects.ObiSocketEgress,
-			MapFD:    p.bpfObjects.SockDir.FD(),
+			Program:  p.egressObjs.ObiSocketEgress,
+			MapFD:    p.sockopsObjs.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
 		{
-			Program:  p.bpfObjects.ObiSocketIngress,
-			MapFD:    p.bpfObjects.SockDir.FD(),
+			Program:  p.ingressObjs.ObiSocketIngress,
+			MapFD:    p.sockopsObjs.SockDir.FD(),
 			AttachAs: ebpf.AttachSkSKBStreamVerdict,
 		},
 	}
 }
 
 func (p *Tracer) SockOps() []ebpfcommon.SockOps {
+	//return nil
 	return []ebpfcommon.SockOps{
 		{
-			Program:  p.bpfObjects.ObiSockmapTracker,
+			Program:  p.sockopsObjs.ObiSockmapTracker,
 			AttachAs: ebpf.AttachCGroupSockOps,
 		},
 	}
@@ -242,7 +185,7 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter {
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing {
 	return []*ebpfcommon.Tracing{
 		{
-			Program:  p.bpfObjects.ObiInetCskAccept,
+			Program:  p.ingressObjs.ObiInetCskAccept,
 			AttachAs: ebpf.AttachTraceFExit,
 		},
 	}
@@ -263,7 +206,9 @@ func (p *Tracer) Run(ctx context.Context, _ *ebpfcommon.EBPFEventContext, _ *msg
 
 	<-ctx.Done()
 
-	p.bpfObjects.Close()
+	p.egressObjs.Close()
+	p.ingressObjs.Close()
+	p.sockopsObjs.Close()
 
 	p.log.Debug("tpinjector terminated")
 }

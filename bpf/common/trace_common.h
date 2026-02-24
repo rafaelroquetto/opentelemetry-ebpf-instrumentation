@@ -101,6 +101,8 @@ static __always_inline tp_info_pid_t *find_puma_parent_trace(u64 id) {
 
 static __always_inline tp_info_pid_t *
 find_nodejs_parent_trace(const pid_connection_info_t *p_conn, u16 orig_dport, u64 pid_tgid) {
+    bpf_dbg_enter();
+
     connection_info_part_t client_part = {};
     populate_ephemeral_info(&client_part, &p_conn->conn, orig_dport, p_conn->pid, FD_CLIENT);
     fd_info_t *fd_info = fd_info_for_conn(&client_part);
