@@ -3,7 +3,7 @@
 
 //go:build linux
 
-package tpinjector
+package socktracer
 
 import (
 	"testing"
@@ -14,11 +14,21 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
+	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/obi"
 )
 
-// tpinjector has two BPF specs: the main tpinjector (spec 0) and the sock iterator (spec 1).
-const expectedSpecCount = 2
+const expectedSpecCount = 4
+
+// findConstant searches all bundles for a constant by name, returning its value and whether it was found.
+func findConstant(bundles []*ebpfcommon.SpecBundle, name string) (any, bool) {
+	for _, b := range bundles {
+		if v, ok := b.Constants[name]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
 
 func TestTracer_Constants(t *testing.T) {
 	tests := []struct {
@@ -96,28 +106,19 @@ func TestTracer_Constants(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, bundles, expectedSpecCount, "tpinjector bundle count must match")
 
-			// Spec 0 (tpinjector) carries the main constants.
-			c := bundles[0].Constants
-
-			injectFlags, ok := c["inject_flags"]
+			injectFlags, ok := findConstant(bundles, "inject_flags")
 			assert.True(t, ok, "inject_flags should be present")
 			assert.Equal(t, tt.expectedInjectFlags, injectFlags)
 
-			filterPids, ok := c["filter_pids"]
-			assert.True(t, ok, "filter_pids should be present")
-			assert.Equal(t, tt.expectedFilterPids, filterPids)
-
-			_, ok = c["max_transaction_time"]
+			_, ok = findConstant(bundles, "max_transaction_time")
 			assert.True(t, ok, "max_transaction_time should be present")
 
-			_, ok = c["g_bpf_debug"]
+			_, ok = findConstant(bundles, "g_bpf_debug")
 			assert.True(t, ok, "g_bpf_debug should be present")
 
-			// Spec 1 (sock_iter) carries only the debug flag.
-			iterC := bundles[1].Constants
-			_, ok = iterC["g_bpf_debug"]
-			assert.True(t, ok, "iter g_bpf_debug should be present")
-			assert.Len(t, iterC, 1, "iter spec should have only g_bpf_debug")
+			filterPids, ok := findConstant(bundles, "filter_pids")
+			assert.True(t, ok, "filter_pids should be present")
+			assert.Equal(t, tt.expectedFilterPids, filterPids)
 		})
 	}
 }

@@ -26,115 +26,139 @@
 
 #include <logger/bpf_dbg.h>
 
-#include <maps/incoming_trace_map.h>
 #include <maps/msg_buffers.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/sock_dir.h>
-#include <maps/tp_info_mem.h>
 
 #include <pid/pid.h>
 
-#include <tpinjector/maps/sk_tp_info_pid_map.h>
+#include <shared/obi_ctx.h>
+
+#include <socktracer/common_defs.h>
+#include <socktracer/helpers.h>
+#include <socktracer/http.h>
+#include <socktracer/tcp.h>
+#include <socktracer/maps/sk_data_map.h>
+#include <socktracer/maps/sk_storage_map.h>
+#include <socktracer/maps/sk_tp_info_pid_map.h>
+#include <socktracer/sk_storage_data.h>
+#include <socktracer/socket_data.h>
+
+volatile const u32 track_request_headers = 0;
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
-// Flags to control what tpinjector should inject
+static __always_inline u32 ctx_len(void *ctx) {
+    return ((struct sk_msg_md *)ctx)->size;
+}
+
+static __always_inline void ctx_pull_data(void *ctx, u32 len) {
+    bpf_msg_pull_data(ctx, 0, len, 0);
+}
+
+static __always_inline void *ctx_data(void *ctx) {
+    return ((struct sk_msg_md *)ctx)->data;
+}
+
+static __always_inline void *ctx_data_end(void *ctx) {
+    return ((struct sk_msg_md *)ctx)->data_end;
+}
+
+static __always_inline pid_connection_info_t
+pid_connection_info(const struct socket_data *sk_data) {
+    const pid_connection_info_t p_conn = {.conn = sk_data->sorted_conn,
+                                          .pid = sk_data->pid_tgid};
+
+    return p_conn;
+}
+
+static __always_inline void set_client_trace(const struct socket_data *sk_data,
+                                             const tp_info_pid_t *tp_p) {
+    set_trace_info_for_connection(&sk_data->sorted_conn, TRACE_TYPE_CLIENT, tp_p);
+
+    const egress_key_t e_key = {
+        .d_port = sk_data->sorted_conn.d_port,
+        .s_port = sk_data->sorted_conn.s_port,
+    };
+
+    bpf_map_update_elem(&outgoing_trace_map, &e_key, tp_p, BPF_ANY);
+
+    obi_ctx__set(sk_data->pid_tgid, &tp_p->tp);
+}
+
+static __always_inline void set_trace(const struct socket_data *sk_data,
+                                      const tp_info_pid_t *tp_p) {
+    set_client_trace(sk_data, tp_p);
+}
+
+// Flags to control what socktracer should inject
 enum {
     k_inject_http_headers = 1 << 0, // Bit 0: inject HTTP headers
     k_inject_tcp_options = 1 << 1,  // Bit 1: inject TCP options
 };
 
-volatile const u32 inject_flags =
-    k_inject_http_headers | k_inject_tcp_options; // default: both enabled
+volatile const u32 inject_flags = k_inject_http_headers | k_inject_tcp_options;
 
-// TCP option kind for OpenTelemetry context propagation
-// Kind 25 is unassigned per IANA TCP Parameters registry (released 2000-12-18)
-// Better than experimental options (253-254) which must not be shipped as defaults
-enum { k_tcp_option_kind_otel = 25 };
+enum {
+    k_tail_packet_extender,
+    k_tail_write_msg_traceparent,
+    k_tail_egress_http_req,
+    k_tail_egress_http_create_tp,
+    k_tail_egress_http_found_tp,
+};
 
-enum { k_tail_write_msg_traceparent, k_tail_find_existing_tp, k_tail_create_tp };
-
+int obi_packet_extender(struct sk_msg_md *msg);
 int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg);
-int obi_packet_extender_find_existing_tp(struct sk_msg_md *msg);
-int obi_packet_extender_create_tp(struct sk_msg_md *msg);
+int obi_egress_http_req(struct sk_msg_md *msg);
+int obi_egress_http_create_tp(struct sk_msg_md *msg);
+int obi_egress_http_found_tp(struct sk_msg_md *msg);
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 3);
+    __uint(max_entries, 5);
     __uint(key_size, sizeof(u32));
     __array(values, int(void *));
-} extender_jump_table SEC(".maps") = {
+} obi_egress_progs SEC(".maps") = {
     .values =
         {
+            [k_tail_packet_extender] = (void *)&obi_packet_extender,
             [k_tail_write_msg_traceparent] = (void *)&obi_packet_extender_write_msg_tp,
-            [k_tail_find_existing_tp] = (void *)&obi_packet_extender_find_existing_tp,
-            [k_tail_create_tp] = (void *)&obi_packet_extender_create_tp,
+            [k_tail_egress_http_req] = (void *)&obi_egress_http_req,
+            [k_tail_egress_http_create_tp] = (void *)&obi_egress_http_create_tp,
+            [k_tail_egress_http_found_tp] = (void *)&obi_egress_http_found_tp,
         },
 };
 
-typedef struct tailcall_ctx {
-    pid_connection_info_t p_conn;
-    tp_info_t parent_tp;
-    egress_key_t e_key;
-    u8 niter;
-    bool has_parent_tp;
-    u8 pad[2];
-} tailcall_ctx;
-
-SCRATCH_MEM(tailcall_ctx);
-SCRATCH_MEM_SIZED(tp_str_buf, 64)
-
-#ifndef ENOMSG
-#define ENOMSG 42
-#endif
-
-struct tp_option {
-    u8 kind;
-    u8 len;
-    unsigned char trace_id[TRACE_ID_SIZE_BYTES];
-    unsigned char span_id[SPAN_ID_SIZE_BYTES];
-};
-
-static __always_inline const char *tp_string_from_opt(const struct tp_option *opt) {
-    unsigned char *buf = tp_str_buf_mem();
-
-    if (!buf) {
-        return NULL;
-    }
-
-    unsigned char *ptr = buf;
-
-    // Version
-    *ptr++ = '0';
-    *ptr++ = '0';
-    *ptr++ = '-';
-
-    // Trace ID
-    encode_hex(ptr, opt->trace_id, TRACE_ID_SIZE_BYTES);
-    ptr += TRACE_ID_CHAR_LEN;
-
-    *ptr++ = '-';
-
-    // SpanID
-    encode_hex(ptr, opt->span_id, SPAN_ID_SIZE_BYTES);
-    ptr += SPAN_ID_CHAR_LEN;
-
-    *ptr++ = '-';
-
-    *ptr++ = '0';
-    *ptr++ = '\0';
-
-    return (const char *)buf;
+static __always_inline void *prog_map() {
+    return &obi_egress_progs;
 }
 
-static __always_inline void print_tp(const char *msg, const tp_info_t *tp) {
-    if (!g_bpf_debug) {
-        return;
-    }
+static __always_inline u32 tail_http_req() {
+    return k_tail_egress_http_req;
+}
 
-    unsigned char tp_buf_str[TP_MAX_VAL_LENGTH];
-    make_tp_string(tp_buf_str, tp);
-    bpf_dbg_printk("%s: %s", msg, tp_buf_str);
+static __always_inline u32 tail_http_create_tp() {
+    return k_tail_egress_http_create_tp;
+}
+
+static __always_inline u32 tail_http_found_tp() {
+    return k_tail_egress_http_found_tp;
+}
+
+static __always_inline unsigned char *tp_span_id_field(tp_info_t *tp) {
+    return tp->span_id;
+}
+
+[[maybe_unused]]
+static __always_inline egress_key_t make_key(const connection_info_t *conn) {
+    egress_key_t e_key = {
+        .d_port = conn->d_port,
+        .s_port = conn->s_port,
+    };
+
+    sort_egress_key(&e_key);
+
+    return e_key;
 }
 
 // This is setup here for Go and SSL tracking.
@@ -144,10 +168,12 @@ static __always_inline void print_tp(const char *msg, const tp_info_t *tp) {
 // be injecting the Traceparent in. Another place which sets up this map is
 // the kprobe on tcp_sendmsg, however that happens after the sock_msg runs,
 // so we have a different detection for that - protocol_detector.
+[[maybe_unused]]
 static __always_inline tp_info_pid_t *get_tp_info_pid(const egress_key_t *e_key) {
     return bpf_map_lookup_elem(&outgoing_trace_map, e_key);
 }
 
+[[maybe_unused]]
 static __always_inline void set_tp_info_pid(const egress_key_t *e_key, const tp_info_pid_t *tp_p) {
     bpf_map_update_elem(&outgoing_trace_map, e_key, tp_p, BPF_ANY);
 }
@@ -159,57 +185,6 @@ static __always_inline void clear_tp_info_pid(const egress_key_t *e_key) {
 static __always_inline u8 already_tracked(const pid_connection_info_t *p_conn) {
     return already_tracked_http(p_conn) || already_tracked_tcp(p_conn) ||
            already_tracked_http2(p_conn);
-}
-
-// Extracts what we need for connection_info_t from bpf_sock_ops if the
-// communication is IPv4
-static __always_inline connection_info_t sk_ops_extract_key_ip4(struct bpf_sock_ops *ops) {
-    connection_info_t conn = {};
-
-    const u32 local_ip4 = ops->local_ip4;
-    const u32 remote_ip4 = ops->remote_ip4;
-    const u32 local_port = ops->local_port;
-    const u32 remote_port = bpf_ntohl(ops->remote_port);
-
-    __builtin_memcpy(conn.s_addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
-    conn.s_ip[3] = local_ip4;
-    __builtin_memcpy(conn.d_addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
-    conn.d_ip[3] = remote_ip4;
-
-    conn.s_port = local_port;
-    conn.d_port = remote_port;
-
-    return conn;
-}
-
-// Extracts what we need for connection_info_t from bpf_sock_ops if the
-// communication is IPv6
-// The order of copying the data from bpf_sock_ops matters and must match how
-// the struct is laid in vmlinux.h, otherwise the verifier thinks we are modifying
-// the context twice.
-static __always_inline connection_info_t sk_ops_extract_key_ip6(struct bpf_sock_ops *ops) {
-    connection_info_t conn = {};
-
-    conn.d_ip[0] = ops->remote_ip6[0];
-    conn.d_ip[1] = ops->remote_ip6[1];
-    conn.d_ip[2] = ops->remote_ip6[2];
-    conn.d_ip[3] = ops->remote_ip6[3];
-    conn.s_ip[0] = ops->local_ip6[0];
-    conn.s_ip[1] = ops->local_ip6[1];
-    conn.s_ip[2] = ops->local_ip6[2];
-    conn.s_ip[3] = ops->local_ip6[3];
-
-    const u32 local_port = ops->local_port;
-    const u32 remote_port = bpf_ntohl(ops->remote_port);
-
-    conn.d_port = remote_port;
-    conn.s_port = local_port;
-
-    return conn;
-}
-
-static __always_inline connection_info_t get_connection_info_ops(struct bpf_sock_ops *ops) {
-    return ops->family == AF_INET6 ? sk_ops_extract_key_ip6(ops) : sk_ops_extract_key_ip4(ops);
 }
 
 // Extracts what we need for connection_info_t from sk_msg_md if the
@@ -245,6 +220,7 @@ static __always_inline connection_info_t sk_msg_extract_key_ip6(struct sk_msg_md
     return conn;
 }
 
+[[maybe_unused]]
 static __always_inline void init_tp_ctx_parent_tp(tailcall_ctx *t_ctx) {
     t_ctx->parent_tp.ts = bpf_ktime_get_ns();
     t_ctx->parent_tp.flags = 1;
@@ -253,6 +229,7 @@ static __always_inline void init_tp_ctx_parent_tp(tailcall_ctx *t_ctx) {
         &t_ctx->p_conn, t_ctx->p_conn.conn.d_port, &t_ctx->parent_tp);
 }
 
+[[maybe_unused]]
 static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info_pid_t *tp_p) {
     // t_ctx->parent_tp was initialised earlier in init_tp_ctx_parent_tp - if
     // t_ctx->has_parent_tp is true, then it actually contains a valid tp_info
@@ -260,7 +237,7 @@ static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info
     // a new span_id
     // this logic is cumbersome, but it is done so to avoid calling
     // find_trace_for_client_request multiple times (i.e. once here, and once
-    // earlier in  k_tail_find_existing_tp - sorry!
+    // earlier in  k_tail_egress_http_req - sorry!
     urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
     tp_p->tp.flags = 1;
     tp_p->valid = 1;
@@ -280,150 +257,6 @@ static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info
     }
 
     return true;
-}
-
-static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u8 flags) {
-    bpf_sock_ops_cb_flags_set(skops, skops->bpf_sock_ops_cb_flags | flags);
-}
-
-// Helper that writes in the sock map for a sock_ops program
-static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
-    const u64 cookie = bpf_get_socket_cookie(skops);
-
-    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
-    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
-}
-
-static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
-    bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
-}
-
-static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {
-    struct bpf_sock *sk = skops->sk;
-
-    if (!sk) {
-        return;
-    }
-
-    tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
-
-    if (!tp_pid) {
-        return;
-    }
-
-    const long ret = bpf_reserve_hdr_opt(skops, sizeof(struct tp_option), 0);
-
-    if (ret != 0) {
-        bpf_dbg_printk("failed to reserve TCP option: %d", ret);
-        return;
-    }
-}
-
-static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops) {
-    struct bpf_sock *sk = skops->sk;
-
-    if (!sk) {
-        return;
-    }
-
-    const tp_info_pid_t *tp_pid = bpf_sk_storage_get(&sk_tp_info_pid_map, sk, NULL, 0);
-
-    if (!tp_pid) {
-        bpf_dbg_printk("tp info not found");
-        return;
-    }
-
-    // cleanup the storage to prevent it from being written more than once
-    // (including during responses);
-    bpf_sk_storage_delete(&sk_tp_info_pid_map, sk);
-
-    struct tp_option opt = {.kind = k_tcp_option_kind_otel, .len = sizeof(struct tp_option)};
-
-    __builtin_memcpy(opt.trace_id, tp_pid->tp.trace_id, sizeof(opt.trace_id));
-    __builtin_memcpy(opt.span_id, tp_pid->tp.span_id, sizeof(opt.span_id));
-
-    const long ret = bpf_store_hdr_opt(skops, &opt, sizeof(opt), 0);
-
-    if (ret != 0) {
-        bpf_dbg_printk("failed to store option: %d", ret);
-    }
-
-    if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt);
-
-        if (tp_str) {
-            bpf_dbg_printk("written TP to TCP options: %s", tp_str);
-        }
-    }
-}
-
-static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
-    struct tp_option opt = {};
-    opt.kind = k_tcp_option_kind_otel;
-
-    const long ret = bpf_load_hdr_opt(skops, &opt, sizeof(opt), 0);
-
-    if (ret == -ENOMSG) {
-        return;
-    }
-
-    if (ret < 0) {
-        bpf_dbg_printk("error parsing TCP option: %d", ret);
-        return;
-    }
-
-    if (g_bpf_debug) {
-        const char *tp_str = tp_string_from_opt(&opt);
-
-        if (tp_str) {
-            bpf_dbg_printk("found TP in TCP options: %s", tp_str);
-        }
-    }
-
-    tp_info_pid_t tp = {};
-    tp.valid = 1;
-
-    __builtin_memcpy(tp.tp.trace_id, opt.trace_id, sizeof(tp.tp.trace_id));
-    __builtin_memcpy(tp.tp.span_id, opt.span_id, sizeof(tp.tp.span_id));
-
-    connection_info_t conn = get_connection_info_ops(skops);
-    sort_connection_info(&conn);
-
-    dbg_print_http_connection_info(&conn);
-    bpf_map_update_elem(&incoming_trace_map, &conn, &tp, BPF_ANY);
-}
-
-// Tracks all outgoing sockets (BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB)
-// We don't track incoming, those would be BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB
-SEC("sockops")
-int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
-    struct bpf_sock *sk = skops->sk;
-
-    if (!sk) {
-        return 1;
-    }
-
-    switch (skops->op) {
-    case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
-        bpf_sock_ops_active_est_cb(skops);
-        break;
-    case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
-        bpf_sock_ops_passive_est_cb(skops);
-        break;
-    case BPF_SOCK_OPS_HDR_OPT_LEN_CB:
-        bpf_sock_ops_opt_len_cb(skops);
-        break;
-    case BPF_SOCK_OPS_WRITE_HDR_OPT_CB:
-        bpf_sock_ops_write_hdr_cb(skops);
-        break;
-    case BPF_SOCK_OPS_PARSE_HDR_OPT_CB:
-        bpf_sock_ops_parse_hdr_cb(skops);
-        break;
-    default:
-        break;
-    }
-
-    return 1;
 }
 
 // This code is copied from the kprobe on tcp_sendmsg and it's called from
@@ -500,80 +333,13 @@ static __always_inline u8 protocol_detector(struct sk_msg_md *msg,
     return 0;
 }
 
+[[maybe_unused]]
 static __always_inline connection_info_t get_connection_info(struct sk_msg_md *msg) {
     return msg->family == AF_INET6 ? sk_msg_extract_key_ip6(msg) : sk_msg_extract_key_ip4(msg);
 }
 
 // this "beauty" ensures we hold pkt in the same register being range
 // validated
-static __always_inline unsigned char *
-check_pkt_access(unsigned char *buf, //NOLINT(readability-non-const-parameter)
-                 u32 offset,
-                 const unsigned char *end) {
-    unsigned char *ret;
-
-    asm goto("r4 = %[buf]\n"
-             "r4 += %[offset]\n"
-             "if r4 > %[end] goto %l[error]\n"
-             "%[ret] = %[buf]"
-             : [ret] "=r"(ret)
-             : [buf] "r"(buf), [end] "r"(end), [offset] "i"(offset)
-             : "r4"
-             : error);
-
-    return ret;
-error:
-    return NULL;
-}
-
-static __always_inline void
-make_tp_string_skb(unsigned char *buf, const tp_info_t *tp, const unsigned char *end) {
-    buf = check_pkt_access(buf, TP_SIZE, end);
-
-    if (!buf) {
-        return;
-    }
-
-    const __attribute__((unused)) unsigned char *tp_string = buf;
-
-    *buf++ = 'T';
-    *buf++ = 'r';
-    *buf++ = 'a';
-    *buf++ = 'c';
-    *buf++ = 'e';
-    *buf++ = 'p';
-    *buf++ = 'a';
-    *buf++ = 'r';
-    *buf++ = 'e';
-    *buf++ = 'n';
-    *buf++ = 't';
-    *buf++ = ':';
-    *buf++ = ' ';
-
-    // Version
-    *buf++ = '0';
-    *buf++ = '0';
-    *buf++ = '-';
-
-    // Trace ID
-    encode_hex(buf, tp->trace_id, TRACE_ID_SIZE_BYTES);
-    buf += TRACE_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    // SpanID
-    encode_hex(buf, tp->span_id, SPAN_ID_SIZE_BYTES);
-    buf += SPAN_ID_CHAR_LEN;
-
-    *buf++ = '-';
-
-    *buf++ = '0';
-    *buf++ = '0' + (tp->flags & k_flag_sampled);
-    *buf++ = '\r';
-    *buf++ = '\n';
-
-    bpf_dbg_printk("tp_string=%s", tp_string);
-}
 
 static __always_inline bool
 extend_and_write_tp(struct sk_msg_md *msg, u32 offset, const tp_info_t *tp) {
@@ -623,7 +389,13 @@ static __always_inline bool write_msg_traceparent(struct sk_msg_md *msg, const t
     return extend_and_write_tp(msg, write_offset, tp);
 }
 
-static __always_inline void schedule_write_tcp_option(struct sk_msg_md *msg, tp_info_pid_t *tp_p) {
+static __always_inline void schedule_write_tcp_option(void *ctx, tp_info_pid_t *tp_p) {
+    if (!(inject_flags & k_inject_tcp_options)) {
+        return;
+    }
+
+    struct sk_msg_md *msg = (struct sk_msg_md *)ctx;
+
     struct bpf_sock *sk = msg->sk;
 
     if (!sk) {
@@ -645,7 +417,7 @@ static __always_inline void schedule_write_tcp_option(struct sk_msg_md *msg, tp_
 
 static __always_inline void write_http_traceparent(struct sk_msg_md *msg, tp_info_pid_t *tp_pid) {
     // used for the upcoming tailcall
-    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
+    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_buf_mem();
 
     if (!tp_p) {
         return;
@@ -654,19 +426,18 @@ static __always_inline void write_http_traceparent(struct sk_msg_md *msg, tp_inf
     tp_pid->written = 1;
     *tp_p = *tp_pid;
 
-    bpf_tail_call_static(msg, &extender_jump_table, k_tail_write_msg_traceparent);
+    bpf_tail_call_static(msg, &obi_egress_progs, k_tail_write_msg_traceparent);
 
     bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
 }
 
+[[maybe_unused]]
 static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
                                                    u64 id,
                                                    const connection_info_t *conn,
                                                    const egress_key_t *e_key,
                                                    tp_info_pid_t *tp_pid) {
-    if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_pid);
-    }
+    schedule_write_tcp_option(msg, tp_pid);
 
     // shortcut: if valid == 0, this is not a HTTP request (likely SSL, but
     // could be anything really - don't bother with protocol_detector)
@@ -688,9 +459,99 @@ static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
     clear_tp_info_pid(e_key);
 }
 
-// Sock_msg program which detects packets where it should add space for
-// the 'Traceparent' string. It extends the HTTP header and writes the
-// Traceparent string.
+static __always_inline bool backfill_pid(struct sk_msg_md *msg,
+                                         struct socket_data *sk_data,
+                                         const struct sk_storage_data *sk_storage) {
+    if (sk_data->pid_tgid != 0) {
+        return true;
+    }
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (valid_pid(id)) {
+        sk_data->pid_tgid = id;
+        sk_data->task_tid = get_task_tid();
+
+        task_pid(&sk_data->pid_info);
+        task_tid(&sk_data->pid_key);
+
+        return true;
+    }
+
+    bpf_map_delete_elem(&sk_data_map, &sk_storage->sk_cookie);
+    bpf_sk_storage_delete(&sk_storage_map, msg->sk);
+
+    return false;
+}
+
+static __always_inline void obi_server_egress(struct sk_msg_md *msg, struct socket_data *sk_data) {
+    bpf_dbg_enter();
+
+    if (handle_http_res(msg, sk_data)) {
+        return;
+    }
+
+    handle_tcp_res(msg, sk_data);
+}
+
+static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct socket_data *sk_data) {
+    bpf_dbg_enter();
+
+    if (handle_http_req(msg, sk_data)) {
+        return;
+    }
+
+    handle_tcp(msg, sk_data);
+}
+
+SEC("sk_msg")
+int obi_socket_egress(struct sk_msg_md *msg) {
+    const struct sk_storage_data *sk_storage =
+        bpf_sk_storage_get(&sk_storage_map, msg->sk, NULL, 0);
+
+    if (!sk_storage) {
+        return SK_PASS;
+    }
+
+    struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &sk_storage->sk_cookie);
+
+    if (!sk_data) {
+        bpf_printk("socket no longer tracked, cleaning up storage");
+
+        bpf_sk_storage_delete(&sk_storage_map, msg->sk);
+
+        return SK_PASS;
+    }
+
+    bpf_dbg_printk("cookie=%llu", sk_storage->sk_cookie);
+
+    if (!backfill_pid(msg, sk_data, sk_storage)) {
+        return SK_PASS;
+    }
+
+    switch (sk_data->sk_type) {
+    case sk_type_server:
+        obi_server_egress(msg, sk_data);
+        break;
+    case sk_type_client:
+        obi_client_egress(msg, sk_data);
+        break;
+    }
+
+    bpf_dbg_printk("ret %s", ctx_data(msg));
+    return SK_PASS;
+}
+
+SEC("sk_msg")
+int obi_packet_extender(struct sk_msg_md *msg) {
+    bpf_dbg_enter();
+
+    bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_req);
+
+    return SK_PASS;
+}
+
+#if 0
 SEC("sk_msg")
 int obi_packet_extender(struct sk_msg_md *msg) {
     // If neither injection method is enabled, nothing to do
@@ -727,9 +588,24 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     // Valid PID only works for kprobes since Go programs don't add their
     // PIDs to the PID map (we instrument the binaries), handled in the
     // previous check
-    if (!valid_pid(id)) {
+    const struct sk_storage_data *sk_data = bpf_sk_storage_get(&sk_storage_map, msg->sk, NULL, 0);
+
+    if (!sk_data) {
+        bpf_printk("no sk data msg->sk = %llx", msg->sk);
         return SK_PASS;
     }
+
+    const struct socket_data *data = bpf_map_lookup_elem(&sk_data_map, &sk_data->sk_cookie);
+
+    if (!data) {
+        bpf_printk("socket no longer tracked, cleaning up storage");
+
+        bpf_sk_storage_delete(&sk_storage_map, msg->sk);
+
+        return SK_PASS;
+    }
+
+    bpf_printk("obi_packet_extender");
 
     bpf_dbg_printk("MSG=%llx:%d ->", conn.s_ip[3], conn.s_port);
     bpf_dbg_printk("MSG TO=%llx:%d", conn.d_ip[3], conn.d_port);
@@ -762,17 +638,18 @@ int obi_packet_extender(struct sk_msg_md *msg) {
 
     init_tp_ctx_parent_tp(t_ctx);
 
-    bpf_tail_call_static(msg, &extender_jump_table, k_tail_find_existing_tp);
+    bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_req);
 
     return SK_PASS;
 }
+#endif
 
 //k_tail_write_msg_traceparent
 SEC("sk_msg")
 int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg) {
-    bpf_dbg_printk("=== sk_msg ===");
+    bpf_dbg_enter();
 
-    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
+    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_buf_mem();
 
     if (!tp_p) {
         bpf_dbg_printk("empty tp_buf");
@@ -792,7 +669,7 @@ int obi_packet_extender_write_msg_tp(struct sk_msg_md *msg) {
 }
 
 static __always_inline void
-assign_parent_tp(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
+init_span_id(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
     if (!t_ctx->has_parent_tp) {
         return;
     }
@@ -824,146 +701,55 @@ assign_parent_tp(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_i
     encode_hex(span_id, tp->span_id, SPAN_ID_SIZE_BYTES);
 }
 
-//k_tail_find_existing_tp
+//k_tail_egress_http_req
 SEC("sk_msg")
-int obi_packet_extender_find_existing_tp(struct sk_msg_md *msg) {
-    const u32 k_max_iter = 4; // iterate up to 4KB
+int obi_egress_http_req(struct sk_msg_md *msg) {
+    bpf_dbg_enter();
 
-    tailcall_ctx *t_ctx = tailcall_ctx_mem();
-
-    if (!t_ctx) {
-        return SK_PASS;
-    }
-
-    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
-
-    if (!tp_p) {
-        return SK_PASS;
-    }
-
-    const u32 niter = t_ctx->niter;
-
-    if (niter >= k_max_iter) {
-        return SK_PASS;
-    }
-
-    unsigned char *b = msg->data;
-    const unsigned char *e = msg->data_end;
-    unsigned char *ptr = b + (niter * 1024);
-
-    if (ptr >= e) {
-        return SK_PASS;
-    }
-
-    bpf_dbg_printk("looking for traceparent header (iter=%u)", niter);
-
-    const u32 data_size = (e - ptr) & 0x3ff; // 1KB chunks per iteration
-
-    for (u32 i = 0; i < data_size; ++i) {
-        if ((ptr + TP_SIZE >= e) || is_eoh(ptr)) {
-            bpf_tail_call_static(msg, &extender_jump_table, k_tail_create_tp);
-            break;
-        }
-
-        if (is_traceparent(ptr)) {
-            ptr += TP_TID_PREFIX_SIZE;
-
-            decode_hex(tp_p->tp.trace_id, ptr, TRACE_ID_CHAR_LEN);
-
-            ptr += TRACE_ID_CHAR_LEN;
-
-            if (*ptr++ != '-') {
-                return SK_PASS;
-            }
-
-            decode_hex(tp_p->tp.span_id, ptr, SPAN_ID_CHAR_LEN);
-
-            unsigned char *span_id = ptr;
-
-            ptr += SPAN_ID_CHAR_LEN;
-
-            if (*ptr++ != '-') {
-                return SK_PASS;
-            }
-
-            decode_hex((unsigned char *)&tp_p->tp.flags, ptr, FLAGS_CHAR_LEN);
-
-            ptr += FLAGS_CHAR_LEN;
-
-            if (*ptr++ != '\r' || *ptr != '\n') {
-                return SK_PASS;
-            }
-
-            // if we got to this point, we managed to parse a valid
-            // 'Traceparent: ...' header that we can utilise
-
-            assign_parent_tp(t_ctx, &tp_p->tp, span_id);
-
-            tp_p->tp.ts = bpf_ktime_get_ns();
-            tp_p->tp.flags = 1;
-            tp_p->valid = 1;
-            tp_p->written = 1;
-            tp_p->pid = t_ctx->p_conn.pid;
-            tp_p->req_type = EVENT_HTTP_CLIENT;
-
-            print_tp("found TP in headers", &tp_p->tp);
-
-            set_tp_info_pid(&t_ctx->e_key, tp_p);
-
-            if (inject_flags & k_inject_tcp_options) {
-                schedule_write_tcp_option(msg, tp_p);
-            }
-
-            return SK_PASS;
-        }
-
-        ++ptr;
-    }
-
-    t_ctx->niter++;
-
-    if (t_ctx->niter < k_max_iter) {
-        bpf_tail_call_static(msg, &extender_jump_table, k_tail_find_existing_tp);
-    } else {
-        bpf_tail_call_static(msg, &extender_jump_table, k_tail_create_tp);
-    }
-
-    return SK_PASS;
+    return http_find_tp(msg);
 }
 
-//k_tail_create_tp
+static __always_inline void init_tp(struct socket_data *sk_data, tp_info_t *tp) {
+    const pid_connection_info_t p_conn = pid_connection_info(sk_data);
+
+    tp_info_t parent_tp = {.ts = bpf_ktime_get_ns(), .flags = 1 };
+
+    const bool has_parent =
+        find_parent_trace_for_client_request(&p_conn, sk_data->conn.d_port, &parent_tp);
+
+    if (has_parent) {
+        __builtin_memcpy(tp->trace_id, &parent_tp.trace_id, TRACE_ID_SIZE_BYTES);
+        __builtin_memcpy(tp->parent_id, &parent_tp.span_id, SPAN_ID_SIZE_BYTES);
+    } else {
+        new_trace_id(tp);
+        __builtin_memset(tp->parent_id, 0, SPAN_ID_SIZE_BYTES);
+    }
+}
+
+static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx) {
+    (void)t_ctx;
+
+    if (!(inject_flags & k_inject_http_headers)) {
+        return;
+    }
+
+    // write the HTTP headers
+    bpf_tail_call_static(ctx, &obi_egress_progs, k_tail_write_msg_traceparent);
+    bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
+}
+
+//k_tail_egress_http_create_tp
 SEC("sk_msg")
-int obi_packet_extender_create_tp(struct sk_msg_md *msg) {
-    tailcall_ctx *t_ctx = tailcall_ctx_mem();
+int obi_egress_http_create_tp(struct sk_msg_md *msg) {
+    bpf_dbg_enter();
 
-    if (!t_ctx) {
-        return SK_PASS;
-    }
+    return http_create_tp(msg);
+}
 
-    tp_info_pid_t *tp_p = (tp_info_pid_t *)tp_info_mem();
+//k_tail_egress_http_found_tp
+SEC("sk_msg")
+int obi_egress_http_found_tp(struct sk_msg_md *msg) {
+    bpf_dbg_enter();
 
-    if (!tp_p) {
-        return SK_PASS;
-    }
-
-    if (!create_trace_info(t_ctx, tp_p)) {
-        return SK_PASS;
-    }
-
-    tp_p->written = 1;
-
-    // associate this tp_info to this request
-    set_tp_info_pid(&t_ctx->e_key, tp_p);
-
-    if (inject_flags & k_inject_tcp_options) {
-        schedule_write_tcp_option(msg, tp_p);
-    }
-
-    if (inject_flags & k_inject_http_headers) {
-        // write the HTTP headers
-        bpf_tail_call_static(msg, &extender_jump_table, k_tail_write_msg_traceparent);
-        bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
-    }
-
-    return SK_PASS;
+    return http_found_tp(msg);
 }

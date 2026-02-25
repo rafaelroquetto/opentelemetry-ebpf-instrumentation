@@ -10,5 +10,5 @@ discovery:
   services:
     - name: keepaliveclient
       exe_path: keepaliveclient
-    - name: tpinjector-server
-      exe_path: tpinjector-server
+    - name: socktracer-server
+      exe_path: socktracer-server

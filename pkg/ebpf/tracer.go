@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
 
+
 type Instrumentable struct {
 	Type                 svc.InstrumentableType
 	InstrumentationError error
@@ -122,7 +123,9 @@ type Tracer interface {
 	UnlinkInstrumentedLib(uint64)
 	RegisterOffsets(*exec.FileInfo, *goexec.Offsets)
 	ProcessBinary(*exec.FileInfo)
+	SetEventContext(*ebpfcommon.EBPFEventContext)
 	Required() bool
+	Capabilities() ebpfcommon.TracerCapability
 	// Run will do the action of listening for eBPF traces and forward them
 	// periodically to the output channel.
 	Run(context.Context, *ebpfcommon.EBPFEventContext, *msg.Queue[[]request.Span])

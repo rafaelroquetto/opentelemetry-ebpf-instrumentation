@@ -199,6 +199,12 @@ type sharedForwarder interface {
 	AlreadyForwarded(ctx context.Context)
 }
 
+type TracerCapability uint64
+
+const (
+	CapSocketTracing TracerCapability = 1 << iota
+)
+
 type EBPFEventContext struct {
 	CommonPIDsFilter ServiceFilter
 	SharedRingBuffer sharedForwarder
@@ -206,6 +212,7 @@ type EBPFEventContext struct {
 	RingBufLock      sync.Mutex
 	MapsLock         sync.Mutex
 	LoadLock         sync.Mutex
+	Capabilities     TracerCapability
 }
 
 var MisclassifiedEvents = make(chan MisclassifiedEvent)

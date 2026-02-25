@@ -24,7 +24,7 @@ import (
 	gpueventbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/gpuevent"
 	logenricherbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/logenricher"
 	loggerbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/logger"
-	tpinjectorbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/tpinjector"
+	socktracerbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/socktracer"
 	watcherbpf "go.opentelemetry.io/obi/pkg/internal/ebpf/watcher"
 	netollybpf "go.opentelemetry.io/obi/pkg/internal/netolly/ebpf"
 	rdnsxdpbpf "go.opentelemetry.io/obi/pkg/internal/rdns/ebpf/xdp"
@@ -174,14 +174,14 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		{"disable_black_box_cp", []any{uint32(0), uint32(1)}},
 	})
 
-	// tpinjector
+	// socktracer
 	// inject_flags is a bitmask: bit 0 = HTTP headers, bit 1 = TCP options.
-	forEachCombination(t, "tpinjector/Bpf", tpinjectorbpf.LoadBpf, []constOption{
+	forEachCombination(t, "socktracer/Egress", socktracerbpf.LoadSocktracerEgress, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 		{"filter_pids", []any{int32(0), int32(1)}},
 		{"inject_flags", []any{uint32(0), uint32(1), uint32(2), uint32(3)}},
 	})
-	forEachCombination(t, "tpinjector/BpfIter", tpinjectorbpf.LoadBpfIter, []constOption{
+	forEachCombination(t, "socktracer/SockIter", socktracerbpf.LoadSocktracerSockIter, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 	})
 

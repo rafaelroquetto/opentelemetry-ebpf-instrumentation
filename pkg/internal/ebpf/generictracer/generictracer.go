@@ -46,6 +46,7 @@ type Tracer struct {
 	instrumentedLibs ebpfcommon.InstrumentedLibsT
 	libsMux          sync.Mutex
 	iters            []*ebpfcommon.Iter
+	eventCtx         *ebpfcommon.EBPFEventContext
 }
 
 func tlog() *slog.Logger {
@@ -164,7 +165,7 @@ func (p *Tracer) SetupTailCalls() {
 }
 
 func (p *Tracer) constants() map[string]any {
-	m := make(map[string]any, 2)
+	m := make(map[string]any, 12)
 
 	m["wakeup_data_bytes"] = uint32(p.cfg.EBPF.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{}))
 
@@ -206,7 +207,7 @@ func (p *Tracer) constants() map[string]any {
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
 
-	return m
+	return m;
 }
 
 func (p *Tracer) RegisterOffsets(_ *exec.FileInfo, _ *goexec.Offsets) {}
@@ -244,11 +245,6 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 			Start:    p.bpfObjects.ObiKprobeSysConnect,
 			End:      p.bpfObjects.ObiKretprobeSysConnect,
 		},
-		"sock_recvmsg": {
-			Required: true,
-			Start:    p.bpfObjects.ObiKprobeSockRecvmsg,
-			End:      p.bpfObjects.ObiKretprobeSockRecvmsg,
-		},
 		"tcp_connect": {
 			Required: true,
 			Start:    p.bpfObjects.ObiKprobeTcpConnect,
@@ -264,20 +260,6 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 		"sock_def_error_report": {
 			Required: true,
 			Start:    p.bpfObjects.ObiKprobeSockDefErrorReport,
-		},
-		"tcp_sendmsg": {
-			Required: true,
-			Start:    p.bpfObjects.ObiKprobeTcpSendmsg,
-			End:      p.bpfObjects.ObiKretprobeTcpSendmsg,
-		},
-		// Reading more than 160 bytes
-		"tcp_recvmsg": {
-			Required: true,
-			Start:    p.bpfObjects.ObiKprobeTcpRecvmsg,
-			End:      p.bpfObjects.ObiKretprobeTcpRecvmsg,
-		},
-		"tcp_cleanup_rbuf": {
-			Start: p.bpfObjects.ObiKprobeTcpCleanupRbuf, // this kprobe runs the same code as recvmsg return, we use it because kretprobes can be unreliable.
 		},
 		"sys_clone": {
 			Required: true,
@@ -311,17 +293,36 @@ func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
 		},
 	}
 
-	if p.cfg.EBPF.ContextPropagation.IsEnabled() {
-		// tcp_rate_check_app_limited and tcp_sendmsg_fastopen are backup
-		// for tcp_sendmsg_locked which doesn't fire on certain kernels
-		// if sk_msg is attached.
-		kp["tcp_rate_check_app_limited"] = ebpfcommon.ProbeDesc{
-			Required: false,
-			Start:    p.bpfObjects.ObiKprobeTcpRateCheckAppLimited,
+	// skip per-packet TCP kprobes when socktracer handles traffic at the socket layer
+	if p.eventCtx == nil || p.eventCtx.Capabilities&ebpfcommon.CapSocketTracing == 0 {
+		kp["sock_recvmsg"] = ebpfcommon.ProbeDesc{
+			Required: true,
+			Start:    p.bpfObjects.ObiKprobeSockRecvmsg,
+			End:      p.bpfObjects.ObiKretprobeSockRecvmsg,
 		}
-		kp["tcp_sendmsg_fastopen"] = ebpfcommon.ProbeDesc{
-			Required: false,
-			Start:    p.bpfObjects.ObiKprobeTcpRateCheckAppLimited,
+		kp["tcp_sendmsg"] = ebpfcommon.ProbeDesc{
+			Required: true,
+			Start:    p.bpfObjects.ObiKprobeTcpSendmsg,
+			End:      p.bpfObjects.ObiKretprobeTcpSendmsg,
+		}
+		kp["tcp_recvmsg"] = ebpfcommon.ProbeDesc{
+			Required: true,
+			Start:    p.bpfObjects.ObiKprobeTcpRecvmsg,
+			End:      p.bpfObjects.ObiKretprobeTcpRecvmsg,
+		}
+		kp["tcp_cleanup_rbuf"] = ebpfcommon.ProbeDesc{
+			Start: p.bpfObjects.ObiKprobeTcpCleanupRbuf,
+		}
+
+		if p.cfg.EBPF.ContextPropagation.IsEnabled() {
+			kp["tcp_rate_check_app_limited"] = ebpfcommon.ProbeDesc{
+				Required: false,
+				Start:    p.bpfObjects.ObiKprobeTcpRateCheckAppLimited,
+			}
+			kp["tcp_sendmsg_fastopen"] = ebpfcommon.ProbeDesc{
+				Required: false,
+				Start:    p.bpfObjects.ObiKprobeTcpRateCheckAppLimited,
+			}
 		}
 	}
 
@@ -457,6 +458,9 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 }
 
 func (p *Tracer) SocketFilters() []*ebpf.Program {
+	if p.eventCtx != nil && p.eventCtx.Capabilities&ebpfcommon.CapSocketTracing != 0 {
+		return nil
+	}
 	return []*ebpf.Program{p.bpfObjects.ObiSocketHttpFilter}
 }
 
@@ -649,6 +653,10 @@ func bpfConnInfoT(src ebpfcommon.BpfConnectionInfoT) (dst BpfConnectionInfoT) {
 	dst.S_port = src.S_port
 	return
 }
+
+func (p *Tracer) SetEventContext(ctx *ebpfcommon.EBPFEventContext) { p.eventCtx = ctx }
+
+func (p *Tracer) Capabilities() ebpfcommon.TracerCapability { return 0 }
 
 func (p *Tracer) Required() bool {
 	return true

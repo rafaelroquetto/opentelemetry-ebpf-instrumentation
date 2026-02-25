@@ -23,7 +23,7 @@ const (
 	forwardedSpanID = "1111111111111111"                 // Span ID used in forwarded traceparent
 )
 
-// TestTraceparentExtraction validates that the eBPF tpinjector correctly:
+// TestTraceparentExtraction validates that the eBPF socktracer correctly:
 // 1. Extracts existing Traceparent headers from HTTP requests
 // 2. Uses the extracted trace ID instead of generating a new one
 // 3. Only injects Traceparent when one doesn't already exist

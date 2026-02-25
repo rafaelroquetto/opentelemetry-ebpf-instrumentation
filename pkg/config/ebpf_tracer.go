@@ -75,6 +75,9 @@ type EBPFTracer struct {
 	// Can be a combination of: headers, tcp (e.g., "headers,tcp" or "all")
 	ContextPropagation ContextPropagationMode `yaml:"context_propagation" env:"OTEL_EBPF_BPF_CONTEXT_PROPAGATION"`
 
+	// Enables the socket tracer (sk_msg/sk_skb based). Disabled by default.
+	SocketTracer bool `yaml:"socket_tracer" env:"OTEL_EBPF_BPF_SOCKET_TRACER" validate:"boolean"`
+
 	// Skips checking the kernel version for bpf_loop functionality. Some modified kernels have this
 	// backported prior to version 5.17.
 	OverrideBPFLoopEnabled bool `yaml:"override_bpfloop_enabled" env:"OTEL_EBPF_OVERRIDE_BPF_LOOP_ENABLED" validate:"boolean"`
@@ -169,6 +172,7 @@ func (e *EBPFTracer) CudaInstrumentationEnabled() bool {
 // Default: 0 (disabled).
 type EBPFBufferSizes struct {
 	HTTP     uint32 `yaml:"http" env:"OTEL_EBPF_BPF_BUFFER_SIZE_HTTP" validate:"lte=65536"`
+	TCP      uint32 `yaml:"tcp" env:"OTEL_EBPF_BPF_BUFFER_SIZE_TCP" validate:"lte=65536"`
 	MySQL    uint32 `yaml:"mysql" env:"OTEL_EBPF_BPF_BUFFER_SIZE_MYSQL" validate:"lte=65536"`
 	Kafka    uint32 `yaml:"kafka" env:"OTEL_EBPF_BPF_BUFFER_SIZE_KAFKA" validate:"lte=65536"`
 	Postgres uint32 `yaml:"postgres" env:"OTEL_EBPF_BPF_BUFFER_SIZE_POSTGRES" validate:"lte=65536"`
