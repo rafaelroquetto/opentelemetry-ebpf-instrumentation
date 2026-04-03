@@ -459,22 +459,29 @@ static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
     clear_tp_info_pid(e_key);
 }
 
-static __always_inline bool backfill_pid(struct sk_msg_md *msg,
-                                         struct socket_data *sk_data,
-                                         const struct sk_storage_data *sk_storage) {
+static __always_inline bool backfill_pid_from_current(struct socket_data *sk_data) {
     if (sk_data->pid_tgid != 0) {
         return true;
     }
 
     const u64 id = bpf_get_current_pid_tgid();
 
-    if (valid_pid(id)) {
-        sk_data->pid_tgid = id;
-        sk_data->task_tid = get_task_tid();
+    if (!valid_pid(id)) {
+        return false;
+    }
 
-        task_pid(&sk_data->pid_info);
-        task_tid(&sk_data->pid_key);
+    sk_data->pid_tgid = id;
+    sk_data->task_tid = get_task_tid();
+    task_pid(&sk_data->pid_info);
+    task_tid(&sk_data->pid_key);
 
+    return true;
+}
+
+static __always_inline bool backfill_pid(struct sk_msg_md *msg,
+                                         struct socket_data *sk_data,
+                                         const struct sk_storage_data *sk_storage) {
+    if (backfill_pid_from_current(sk_data)) {
         return true;
     }
 

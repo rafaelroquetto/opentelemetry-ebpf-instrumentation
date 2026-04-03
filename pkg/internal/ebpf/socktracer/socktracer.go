@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -195,7 +196,13 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
 }
 
 func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
-	return nil
+	if p.supportsTrampolines() {
+		return nil
+	}
+
+	return map[string]ebpfcommon.ProbeDesc{
+		"inet_csk_accept": {End: p.ingressObjs.ObiKretInetCskAccept},
+	}
 }
 
 func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
@@ -255,7 +262,17 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter {
 	return p.iters
 }
 
+func (p *Tracer) supportsTrampolines() bool {
+	// BPF trampolines (fexit) are not supported on arm64 kernels < 6.0.
+	major, minor := ebpfcommon.KernelVersion()
+	return !(runtime.GOARCH == "arm64" && (major < 6 || (major == 6 && minor == 0)))
+}
+
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing {
+	if !p.supportsTrampolines() {
+		return nil
+	}
+
 	return []*ebpfcommon.Tracing{
 		{
 			Program:  p.ingressObjs.ObiInetCskAccept,

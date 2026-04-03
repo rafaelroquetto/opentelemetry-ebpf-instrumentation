@@ -282,13 +282,7 @@ int obi_socket_ingress(struct __sk_buff *skb) {
     return SK_PASS;
 }
 
-// used to map a socket cookie to a pid
-SEC("fexit/inet_csk_accept")
-int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accepted_sk) {
-    (void)arg;
-
-    const u64 cookie = bpf_get_socket_cookie(sk);
-    const u64 accepted_cookie = bpf_get_socket_cookie(accepted_sk);
+static __always_inline int backfill_accepted_pid(u64 accepted_cookie) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -299,7 +293,7 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
 
     const u32 pid = id;
 
-    bpf_dbg_printk("pid=%u, cookie=%llu, accepted_cookie=%llu", pid, cookie, accepted_cookie);
+    bpf_dbg_printk("pid=%u, accepted_cookie=%llu", pid, accepted_cookie);
 
     struct socket_data *data = bpf_map_lookup_elem(&sk_data_map, &accepted_cookie);
 
@@ -315,4 +309,31 @@ int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accep
     task_tid(&data->pid_key);
 
     return 0;
+}
+
+// used to map a socket cookie to a pid
+SEC("fexit/inet_csk_accept")
+int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accepted_sk) {
+    (void)arg;
+
+    const u64 cookie = bpf_get_socket_cookie(sk);
+    const u64 accepted_cookie = bpf_get_socket_cookie(accepted_sk);
+
+    bpf_dbg_printk("cookie=%llu, accepted_cookie=%llu", cookie, accepted_cookie);
+
+    return backfill_accepted_pid(accepted_cookie);
+}
+
+// Fallback for arm64 kernels < 6.0 where BPF trampolines (fexit) are unavailable.
+// bpf_get_socket_cookie() requires a skb/sock_ops context, so we read the cookie
+// directly from the sock structure via BTF.
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(obi_kret_inet_csk_accept, struct sock *accepted_sk) {
+    if (!accepted_sk) {
+        return 0;
+    }
+
+    const u64 accepted_cookie = BPF_CORE_READ(accepted_sk, __sk_common.skc_cookie.counter);
+
+    return backfill_accepted_pid(accepted_cookie);
 }
