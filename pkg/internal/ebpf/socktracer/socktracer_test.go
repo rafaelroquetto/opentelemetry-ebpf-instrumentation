@@ -104,7 +104,7 @@ func TestTracer_Constants(t *testing.T) {
 
 			bundles, err := New(cfg).LoadSpecs()
 			require.NoError(t, err)
-			require.Len(t, bundles, expectedSpecCount, "tpinjector bundle count must match")
+			require.Len(t, bundles, expectedSpecCount, "bundle count must match")
 
 			injectFlags, ok := findConstant(bundles, "inject_flags")
 			assert.True(t, ok, "inject_flags should be present")

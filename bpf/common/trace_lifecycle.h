@@ -114,6 +114,7 @@ static __always_inline void server_or_client_trace(
         bpf_map_update_elem(&server_traces_aux, &conn_part, tp_p, BPF_ANY);
 
         tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
+
         if (existing && (existing->req_type == tp_p->req_type) &&
             (tp_p->req_type == EVENT_HTTP_REQUEST)) {
             existing->valid = 0;

@@ -4,7 +4,6 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_builtins.h>
 #include <bpfcore/bpf_helpers.h>
-#include <bpfcore/bpf_endian.h>
 
 #include <common/algorithm.h>
 #include <common/connection_info.h>
@@ -12,10 +11,6 @@
 #include <common/event_defs.h>
 #include <common/http_buf_size.h>
 #include <common/http_types.h>
-#include <common/msg_buffer.h>
-#include <common/protocol_http.h>
-#include <common/protocol_http2.h>
-#include <common/protocol_tcp.h>
 #include <common/scratch_mem.h>
 #include <common/ssl_connection.h>
 #include <common/tc_common.h>
@@ -26,7 +21,6 @@
 
 #include <logger/bpf_dbg.h>
 
-#include <maps/msg_buffers.h>
 #include <maps/outgoing_trace_map.h>
 #include <maps/sock_dir.h>
 
@@ -149,18 +143,6 @@ static __always_inline unsigned char *tp_span_id_field(tp_info_t *tp) {
     return tp->span_id;
 }
 
-[[maybe_unused]]
-static __always_inline egress_key_t make_key(const connection_info_t *conn) {
-    egress_key_t e_key = {
-        .d_port = conn->d_port,
-        .s_port = conn->s_port,
-    };
-
-    sort_egress_key(&e_key);
-
-    return e_key;
-}
-
 // This is setup here for Go and SSL tracking.
 // Essentially, when the Go or the OpenSSL userspace
 // probes activate for an outgoing HTTP request they setup this
@@ -172,170 +154,12 @@ static __always_inline tp_info_pid_t *get_tp_info_pid(const egress_key_t *e_key)
     return bpf_map_lookup_elem(&outgoing_trace_map, e_key);
 }
 
-[[maybe_unused]]
-static __always_inline void set_tp_info_pid(const egress_key_t *e_key, const tp_info_pid_t *tp_p) {
-    bpf_map_update_elem(&outgoing_trace_map, e_key, tp_p, BPF_ANY);
-}
 
 static __always_inline void clear_tp_info_pid(const egress_key_t *e_key) {
     bpf_map_delete_elem(&outgoing_trace_map, e_key);
 }
 
-static __always_inline u8 already_tracked(const pid_connection_info_t *p_conn) {
-    return already_tracked_http(p_conn) || already_tracked_tcp(p_conn) ||
-           already_tracked_http2(p_conn);
-}
 
-// Extracts what we need for connection_info_t from sk_msg_md if the
-// communication is IPv4
-static __always_inline connection_info_t sk_msg_extract_key_ip4(const struct sk_msg_md *msg) {
-    connection_info_t conn = {};
-
-    __builtin_memcpy(conn.s_addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
-    conn.s_ip[3] = msg->local_ip4;
-    __builtin_memcpy(conn.d_addr, ip4ip6_prefix, sizeof(ip4ip6_prefix));
-    conn.d_ip[3] = msg->remote_ip4;
-
-    conn.s_port = msg->local_port;
-    conn.d_port = bpf_ntohl(msg->remote_port);
-
-    return conn;
-}
-
-// Extracts what we need for connection_info_t from sk_msg_md if the
-// communication is IPv6
-// The order of copying the data from bpf_sock_ops matters and must match how
-// the struct is laid in vmlinux.h, otherwise the verifier thinks we are modifying
-// the context twice.
-static __always_inline connection_info_t sk_msg_extract_key_ip6(struct sk_msg_md *msg) {
-    connection_info_t conn = {};
-
-    sk_msg_read_remote_ip6(msg, conn.d_ip);
-    sk_msg_read_local_ip6(msg, conn.s_ip);
-
-    conn.d_port = bpf_ntohl(sk_msg_remote_port(msg));
-    conn.s_port = sk_msg_local_port(msg);
-
-    return conn;
-}
-
-[[maybe_unused]]
-static __always_inline void init_tp_ctx_parent_tp(tailcall_ctx *t_ctx) {
-    t_ctx->parent_tp.ts = bpf_ktime_get_ns();
-    t_ctx->parent_tp.flags = 1;
-
-    t_ctx->has_parent_tp = find_parent_trace_for_client_request(
-        &t_ctx->p_conn, t_ctx->p_conn.conn.d_port, &t_ctx->parent_tp);
-}
-
-[[maybe_unused]]
-static __always_inline bool create_trace_info(const tailcall_ctx *t_ctx, tp_info_pid_t *tp_p) {
-    // t_ctx->parent_tp was initialised earlier in init_tp_ctx_parent_tp - if
-    // t_ctx->has_parent_tp is true, then it actually contains a valid tp_info
-    // with the corrent trace_id and parent_id - all we need to do is generate
-    // a new span_id
-    // this logic is cumbersome, but it is done so to avoid calling
-    // find_trace_for_client_request multiple times (i.e. once here, and once
-    // earlier in  k_tail_egress_http_req - sorry!
-    urand_bytes(tp_p->tp.span_id, sizeof(tp_p->tp.span_id));
-    tp_p->tp.flags = 1;
-    tp_p->valid = 1;
-    tp_p->pid = t_ctx->p_conn.pid;
-    tp_p->req_type = EVENT_HTTP_CLIENT;
-
-    if (t_ctx->has_parent_tp) {
-        bpf_dbg_printk("found existing tp info");
-
-        __builtin_memcpy(tp_p->tp.trace_id, t_ctx->parent_tp.trace_id, sizeof(tp_p->tp.trace_id));
-        __builtin_memcpy(tp_p->tp.parent_id, t_ctx->parent_tp.span_id, sizeof(tp_p->tp.parent_id));
-    } else {
-        bpf_dbg_printk("generating tp info");
-
-        new_trace_id(&tp_p->tp);
-        __builtin_memset(tp_p->tp.parent_id, 0, sizeof(tp_p->tp.parent_id));
-    }
-
-    return true;
-}
-
-// This code is copied from the kprobe on tcp_sendmsg and it's called from
-// the sock_msg program, which does the packet extension for injecting the
-// Traceparent. Since the sock_msg runs before the kprobe on tcp_sendmsg, we
-// need to extend the packet before we'll have the opportunity to setup the
-// outgoing_trace_map metadata. We can directly perhaps run the same code that
-// the kprobe on tcp_sendmsg does, but it's complicated, no tail calls from
-// sock_msg programs and inlining will eventually hit us with the instruction
-// limit when we eventually add HTTP2/gRPC support.
-static __always_inline u8 protocol_detector(struct sk_msg_md *msg,
-                                            u64 id,
-                                            const connection_info_t *conn,
-                                            const egress_key_t *e_key) {
-    bpf_dbg_printk("id=%d, size=%d", id, msg->size);
-
-    pid_connection_info_t p_conn = {};
-    __builtin_memcpy(&p_conn.conn, conn, sizeof(connection_info_t));
-
-    dbg_print_http_connection_info(&p_conn.conn);
-    sort_connection_info(&p_conn.conn);
-    p_conn.pid = pid_from_pid_tgid(id);
-
-    if (msg->size == 0 || is_ssl_connection(&p_conn)) {
-        return 0;
-    }
-
-    msg_buffer_t msg_buf = {
-        .pos = 0,
-        .real_size = min(msg->size, k_msg_buffer_size_max),
-        .cpu_id = bpf_get_smp_processor_id(),
-    };
-
-    bpf_probe_read_kernel(msg_buf.fallback_buf, k_kprobes_http2_buf_size, msg->data);
-
-    const u16 copy_bytes = max(msg_buf.real_size, k_kprobes_http2_buf_size);
-
-    unsigned char **msg_ptr = bpf_map_lookup_elem(&msg_buffer_mem, &(u32){0});
-
-    if (!msg_ptr) {
-        bpf_d_printk("failed to reserve msg_buffer space [%s]", __FUNCTION__);
-        return 0;
-    }
-
-    msg_ptr[0] = 0;
-    bpf_probe_read_kernel(msg_ptr, copy_bytes & k_msg_buffer_size_max_mask, msg->data);
-    bpf_map_update_elem(&msg_buffer_mem, &(u32){0}, msg_ptr, BPF_ANY);
-
-    // We setup any call that looks like HTTP request to be extended.
-    // This must match exactly to what the decision will be for
-    // the kprobe program on tcp_sendmsg, which sets up the
-    // outgoing_trace_map data used by Traffic Control to write the
-    // actual 'Traceparent:...' string.
-
-    if (bpf_map_update_elem(&msg_buffers, e_key, &msg_buf, BPF_ANY)) {
-        // fail if we can't setup a msg buffer
-        return 0;
-    }
-
-    // We should check if we have already seen this request and we've
-    // started tracking it. We only want to extend the first packet that
-    // looks like HTTP, not something that's passing HTTP in the body.
-    if (already_tracked(&p_conn)) {
-        bpf_dbg_printk("already extended before, ignoring this packet...");
-        return 0;
-    }
-
-    if (is_http_request_buf((const unsigned char *)msg_ptr)) {
-        bpf_dbg_printk("setting up request to be extended");
-
-        return 1;
-    }
-
-    return 0;
-}
-
-[[maybe_unused]]
-static __always_inline connection_info_t get_connection_info(struct sk_msg_md *msg) {
-    return msg->family == AF_INET6 ? sk_msg_extract_key_ip6(msg) : sk_msg_extract_key_ip4(msg);
-}
 
 // this "beauty" ensures we hold pkt in the same register being range
 // validated
@@ -430,33 +254,6 @@ static __always_inline void write_http_traceparent(struct sk_msg_md *msg, tp_inf
     bpf_d_printk("tailcall failed [%s]", __FUNCTION__);
 }
 
-[[maybe_unused]]
-static __always_inline void handle_existing_tp_pid(struct sk_msg_md *msg,
-                                                   u64 id,
-                                                   const connection_info_t *conn,
-                                                   const egress_key_t *e_key,
-                                                   tp_info_pid_t *tp_pid) {
-    schedule_write_tcp_option(msg, tp_pid);
-
-    // shortcut: if valid == 0, this is not a HTTP request (likely SSL, but
-    // could be anything really - don't bother with protocol_detector)
-    if (tp_pid->valid == 0) {
-        clear_tp_info_pid(e_key);
-        return;
-    }
-
-    // check if this really is a HTTP request whose headers we can also extend
-    // (it could be an SSL packet instead, or just rubbish, for instance)
-    const bool is_http = protocol_detector(msg, id, conn, e_key);
-
-    if (is_http) {
-        // here we'll leave it for protocol_http clean it up
-        if (inject_flags & k_inject_http_headers) {
-            write_http_traceparent(msg, tp_pid);
-        }
-    }
-    clear_tp_info_pid(e_key);
-}
 
 static __always_inline bool backfill_pid_from_current(struct socket_data *sk_data) {
     if (sk_data->pid_tgid != 0) {
@@ -507,7 +304,7 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
         return true;
     }
 
-    const egress_key_t e_key = make_key(&sk_data->conn);
+    const egress_key_t e_key = make_egress_key(&sk_data->conn);
     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
 
     if (!tp_pid) {
@@ -596,98 +393,6 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     return SK_PASS;
 }
 
-#if 0
-SEC("sk_msg")
-int obi_packet_extender(struct sk_msg_md *msg) {
-    // If neither injection method is enabled, nothing to do
-    if (!(inject_flags & (k_inject_http_headers | k_inject_tcp_options))) {
-        return SK_PASS;
-    }
-
-    tailcall_ctx *t_ctx = tailcall_ctx_mem();
-
-    if (!t_ctx) {
-        return SK_PASS;
-    }
-
-    const u64 id = bpf_get_current_pid_tgid();
-    const connection_info_t conn = get_connection_info(msg);
-    const egress_key_t e_key = make_egress_key(&conn);
-
-    t_ctx->p_conn.conn = conn;
-    t_ctx->p_conn.pid = pid_from_pid_tgid(id);
-    t_ctx->e_key = e_key;
-    t_ctx->niter = 0;
-
-    tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
-
-    // Higher-level uprobes have already set the tp_pid for us (either Go, or SSL)
-    if (tp_pid) {
-        handle_existing_tp_pid(msg, id, &conn, &e_key, tp_pid);
-        return SK_PASS;
-    }
-
-    // At this stage, there were no previously TP information setup - it's the first
-    // time we are seeing this packet - so we need to detect whether this is the start
-    // of a new request and perform any injection if so.
-    // Valid PID only works for kprobes since Go programs don't add their
-    // PIDs to the PID map (we instrument the binaries), handled in the
-    // previous check
-    const struct sk_storage_data *sk_data = bpf_sk_storage_get(&sk_storage_map, msg->sk, NULL, 0);
-
-    if (!sk_data) {
-        bpf_printk("no sk data msg->sk = %llx", msg->sk);
-        return SK_PASS;
-    }
-
-    const struct socket_data *data = bpf_map_lookup_elem(&sk_data_map, &sk_data->sk_cookie);
-
-    if (!data) {
-        bpf_printk("socket no longer tracked, cleaning up storage");
-
-        bpf_sk_storage_delete(&sk_storage_map, msg->sk);
-
-        return SK_PASS;
-    }
-
-    bpf_printk("obi_packet_extender");
-
-    bpf_dbg_printk("MSG=%llx:%d ->", conn.s_ip[3], conn.s_port);
-    bpf_dbg_printk("MSG TO=%llx:%d", conn.d_ip[3], conn.d_port);
-    bpf_dbg_printk("MSG SIZE=%u", msg->size);
-
-    if (msg->size <= MIN_HTTP_SIZE) {
-        // not enough data to detect anything, bail
-        return SK_PASS;
-    }
-
-    bpf_msg_pull_data(msg, 0, msg->size, 0);
-
-    // TODO: execute the protocol handlers here with tail calls, don't
-    // rely on tcp_sendmsg to do it and record these message buffers.
-
-    const u8 is_http = protocol_detector(msg, id, &conn, &e_key);
-
-    // at this point, we can't handle anything other than HTTP, as we need to be able
-    // to tell whether this is the start of a new request
-    if (!is_http) {
-        return SK_PASS;
-    }
-
-    // at this point we've found the start of a new HTTP request
-
-    bpf_dbg_printk("len=%d, s_port=%d", msg->size, msg->local_port);
-    bpf_dbg_printk("buf=[%s]", msg->data);
-    bpf_dbg_printk("ptr=%llx, end=%llx", ctx_msg_data(msg), ctx_msg_data_end(msg));
-    bpf_dbg_printk("BUF=[%s]", ctx_msg_data(msg));
-
-    init_tp_ctx_parent_tp(t_ctx);
-
-    bpf_tail_call_static(msg, &obi_egress_progs, k_tail_egress_http_req);
-
-    return SK_PASS;
-}
-#endif
 
 //k_tail_write_msg_traceparent
 SEC("sk_msg")

@@ -81,7 +81,6 @@ static __always_inline void set_server_trace(const struct socket_data *sk_data,
 
     const trace_key_t t_key = trace_key(sk_data);
 
-#if 0
     tp_info_pid_t *existing = bpf_map_lookup_elem(&server_traces, &t_key);
 
     if (existing && existing->req_type == tp_p->req_type && tp_p->req_type == EVENT_HTTP_REQUEST) {
@@ -89,7 +88,6 @@ static __always_inline void set_server_trace(const struct socket_data *sk_data,
         bpf_dbg_printk("Found conflicting thread server span, marking it invalid.");
         return;
     }
-#endif
 
     bpf_dbg_printk(
         "Saving thread server span for ns=%u, extra_id=%llx", t_key.p_key.ns, t_key.extra_id);

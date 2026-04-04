@@ -12,7 +12,6 @@
 #include <common/connection_info.h>
 #include <common/http_types.h>
 #include <common/iov_iter.h>
-#include <common/msg_buffer.h>
 #include <common/protocol_defs.h>
 #include <common/sock_port_ns.h>
 #include <common/sockaddr.h>
@@ -47,7 +46,6 @@
 #include <maps/fd_map.h>
 #include <maps/filter_ports.h>
 #include <maps/fd_to_connection.h>
-#include <maps/msg_buffers.h>
 #include <maps/sock_pids.h>
 #include <maps/unreadable_buffer_ports.h>
 #include <pid/pid.h>
@@ -424,8 +422,6 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
         const u16 orig_dport = s_args.p_conn.conn.d_port;
         dbg_print_http_connection_info(
             &s_args.p_conn.conn); // commented out since GitHub CI doesn't like this call
-        // Create the egress key before we sort the connection info.
-        egress_key_t e_key = make_egress_key(&s_args.p_conn.conn);
         sort_connection_info(&s_args.p_conn.conn);
         s_args.p_conn.pid = pid_from_pid_tgid(id);
         s_args.orig_dport = orig_dport;
@@ -440,46 +436,6 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
                 unsigned char *buf = iovec_memory();
                 if (buf) {
                     size = read_msghdr_buf(msg, buf, size);
-
-                    // If a sock_msg program is installed, this kprobe will fail to
-                    // read anything, because the data is in bvec physical pages. However,
-                    // the sock_msg will setup a buffer for us if this is the case. We
-                    // look up this buffer and use it instead of what we'd get from
-                    // calling read_msghdr_buf.
-                    if (!size) {
-                        msg_buffer_t *m_buf = bpf_map_lookup_elem(&msg_buffers, &e_key);
-                        bpf_dbg_printk("No size, m_buf=%llx", m_buf);
-                        if (m_buf) {
-                            const u32 cpu_id = bpf_get_smp_processor_id();
-                            if (m_buf->cpu_id != cpu_id) {
-                                bpf_dbg_printk(
-                                    "cpu id mismatch, using stack-allocated fallback buffer");
-                                buf = m_buf->fallback_buf;
-                            } else {
-                                buf = bpf_map_lookup_elem(&msg_buffer_mem, &(u32){0});
-                                if (!buf) {
-                                    bpf_dbg_printk("failed to get msg_buffer");
-                                    return 0;
-                                }
-                            }
-
-                            // The buffer setup for us by a sock_msg program is always the
-                            // full buffer, but when we extend a packet to be able to inject
-                            // a Traceparent field, it will actually be split in 3 chunks:
-                            // [before the injected header],[70 bytes for 'Traceparent...'],[the rest].
-                            // We don't want the handle_buf_with_connection logic to run more than
-                            // once on the same data, so if we find a buf we send all of it to the
-                            // handle_buf_with_connection logic and then mark it as seen by making
-                            // m_buf->pos be the size of the buffer.
-                            if (!m_buf->pos) {
-                                size = m_buf->real_size;
-                                m_buf->pos = size;
-                                bpf_dbg_printk("msg_buffer: size=%d, buf=[%s]", size, buf);
-                            } else {
-                                size = 0;
-                            }
-                        }
-                    }
 
                     // We couldn't find a buffer, for now we just mark the arguments as failed
                     // and see if on the kretprobe we'll have a backup buffer setup for us
@@ -504,12 +460,10 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
                     bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
                     bpf_map_update_elem(&active_send_sock_args, &sock_p, &s_args, BPF_ANY);
 
-                    bpf_map_delete_elem(&msg_buffers, &e_key);
                     // Logically last for !ssl.
                     handle_buf_with_connection(
                         ctx, &s_args.p_conn, buf, size, NO_SSL, TCP_SEND, orig_dport);
                 }
-                bpf_map_delete_elem(&msg_buffers, &e_key);
             } else {
                 bpf_dbg_printk("identified SSL connection, ignoring...");
             }
@@ -530,6 +484,8 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
 // happens on certain kernels if sk_msg is attached.
 SEC("kprobe/tcp_rate_check_app_limited")
 int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
+    (void)ctx;
+
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -545,7 +501,6 @@ int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
     if (parse_sock_info(sk, &s_args.p_conn.conn)) {
         const u16 orig_dport = s_args.p_conn.conn.d_port;
         dbg_print_http_connection_info(&s_args.p_conn.conn);
-        egress_key_t e_key = make_egress_key(&s_args.p_conn.conn);
 
         sort_connection_info(&s_args.p_conn.conn);
         s_args.p_conn.pid = pid_from_pid_tgid(id);
@@ -556,48 +511,7 @@ int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
         cp_support_established(&s_args.p_conn);
 
         u64 *ssl = is_ssl_connection(&s_args.p_conn);
-        if (!ssl) {
-            msg_buffer_t *m_buf = bpf_map_lookup_elem(&msg_buffers, &e_key);
-            if (m_buf) {
-                unsigned char *buf = NULL;
-                const u32 cpu_id = bpf_get_smp_processor_id();
-                if (m_buf->cpu_id != cpu_id) {
-                    bpf_dbg_printk("cpu id mismatch, using stack-allocated fallback buffer");
-                    buf = m_buf->fallback_buf;
-                } else {
-                    buf = bpf_map_lookup_elem(&msg_buffer_mem, &(u32){0});
-                    if (!buf) {
-                        bpf_dbg_printk("failed to get msg_buffer");
-                        return 0;
-                    }
-                }
-
-                // The buffer setup for us by a sock_msg program is always the
-                // full buffer, but when we extend a packet to be able to inject
-                // a Traceparent field, it will actually be split in 3 chunks:
-                // [before the injected header],[70 bytes for 'Traceparent...'],[the rest].
-                // We don't want the handle_buf_with_connection logic to run more than
-                // once on the same data, so if we find a buf we send all of it to the
-                // handle_buf_with_connection logic and then mark it as seen by making
-                // m_buf->pos be the size of the buffer.
-                if (!m_buf->pos) {
-                    s_args.buffer_read = 1;
-                    const u16 size = m_buf->real_size;
-                    m_buf->pos = size;
-                    s_args.size = size;
-                    bpf_dbg_printk("msg_buffer: size %d, buf=[%s]", size, buf);
-                    const u64 sock_p = (u64)sk;
-                    bpf_map_update_elem(&active_send_args, &id, &s_args, BPF_ANY);
-                    bpf_map_update_elem(&active_send_sock_args, &sock_p, &s_args, BPF_ANY);
-
-                    bpf_map_delete_elem(&msg_buffers, &e_key);
-                    // Logically last for !ssl.
-                    handle_buf_with_connection(
-                        ctx, &s_args.p_conn, buf, size, NO_SSL, TCP_SEND, orig_dport);
-                }
-                bpf_map_delete_elem(&msg_buffers, &e_key);
-            }
-        } else {
+        if (ssl) {
             tcp_send_ssl_check(id, (void *)(*ssl), &s_args.p_conn, orig_dport);
         }
     }
