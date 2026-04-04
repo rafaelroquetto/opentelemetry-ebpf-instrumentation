@@ -14,6 +14,8 @@
 
 enum sk_type : u8 { sk_type_client, sk_type_server };
 
+enum ssl_state : u8 { ssl_state_unknown, ssl_state_no, ssl_state_yes };
+
 struct socket_data {
     u64 pid_tgid;
     u64 cookie;
@@ -35,6 +37,7 @@ struct socket_data {
     connection_info_t sorted_conn;
 
     enum sk_type sk_type;
+    enum ssl_state ssl_state;
 
-    u8 _pad[3];
+    u8 _pad[2];
 };

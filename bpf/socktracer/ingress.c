@@ -268,6 +268,10 @@ int obi_socket_ingress(struct __sk_buff *skb) {
         return SK_PASS;
     }
 
+    if (sk_data_is_ssl(sk_data)) {
+        return SK_PASS;
+    }
+
     bpf_dbg_printk("cookie=%llu", cookie);
 
     switch (sk_data->sk_type) {

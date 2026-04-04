@@ -168,7 +168,6 @@ static __always_inline egress_key_t make_key(const connection_info_t *conn) {
 // be injecting the Traceparent in. Another place which sets up this map is
 // the kprobe on tcp_sendmsg, however that happens after the sock_msg runs,
 // so we have a different detection for that - protocol_detector.
-[[maybe_unused]]
 static __always_inline tp_info_pid_t *get_tp_info_pid(const egress_key_t *e_key) {
     return bpf_map_lookup_elem(&outgoing_trace_map, e_key);
 }
@@ -501,8 +500,47 @@ static __always_inline void obi_server_egress(struct sk_msg_md *msg, struct sock
     handle_tcp_res(msg, sk_data);
 }
 
+// checks whether a higher-level uprobe has set a TP for this connection (e.g. SSL or go)
+static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
+                                             struct socket_data *sk_data) {
+    if (sk_data_is_ssl(sk_data)) {
+        return true;
+    }
+
+    const egress_key_t e_key = make_key(&sk_data->conn);
+    tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
+
+    if (!tp_pid) {
+        return false;
+    }
+
+    // if valid == 0, this not a HTTP request (likely SSL, but could be anything) so we only
+    // inject the TCP options and move on
+    if (tp_pid->valid == 0) {
+        schedule_write_tcp_option(msg, tp_pid);
+        clear_tp_info_pid(&e_key);
+        return true;
+    }
+
+    // Go plaintext (valid==1): the Go uprobe already generated the span; just inject
+    // the Traceparent header directly using the Go TP and skip protocol handling.
+    schedule_write_tcp_option(msg, tp_pid);
+
+    if (inject_flags & k_inject_http_headers) {
+        write_http_traceparent(msg, tp_pid);
+    }
+
+    clear_tp_info_pid(&e_key);
+
+    return true;
+}
+
 static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct socket_data *sk_data) {
     bpf_dbg_enter();
+
+    if (handle_uprobe_tp(msg, sk_data)) {
+        return;
+    }
 
     if (handle_http_req(msg, sk_data)) {
         return;
