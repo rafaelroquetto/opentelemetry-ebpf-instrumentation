@@ -70,13 +70,6 @@ static __always_inline void set_client_trace(const struct socket_data *sk_data,
                                              const tp_info_pid_t *tp_p) {
     set_trace_info_for_connection(&sk_data->sorted_conn, TRACE_TYPE_CLIENT, tp_p);
 
-    const egress_key_t e_key = {
-        .d_port = sk_data->sorted_conn.d_port,
-        .s_port = sk_data->sorted_conn.s_port,
-    };
-
-    bpf_map_update_elem(&outgoing_trace_map, &e_key, tp_p, BPF_ANY);
-
     obi_ctx__set(sk_data->pid_tgid, &tp_p->tp);
 }
 
