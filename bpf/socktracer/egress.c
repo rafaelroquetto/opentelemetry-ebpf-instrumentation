@@ -316,6 +316,7 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
     if (tp_pid->valid == 0) {
         schedule_write_tcp_option(msg, tp_pid);
         clear_tp_info_pid(&e_key);
+        sk_data->request.flags = k_request_uprobe_handled;
         return true;
     }
 
@@ -328,6 +329,7 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
     }
 
     clear_tp_info_pid(&e_key);
+    sk_data->request.flags = k_request_uprobe_handled;
 
     return true;
 }

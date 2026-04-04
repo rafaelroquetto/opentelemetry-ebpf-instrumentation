@@ -10,6 +10,7 @@
 #include <socktracer/tailcall_ctx.h>
 
 enum : u8 { k_packet_type_request = 1, k_packet_type_response = 2 };
+enum : u8 { k_request_uprobe_handled = 0xff };
 
 static __always_inline u32 ctx_len(void *ctx);
 static __always_inline void ctx_pull_data(void *ctx, u32 len);
