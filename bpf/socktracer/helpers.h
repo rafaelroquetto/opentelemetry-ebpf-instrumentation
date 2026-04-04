@@ -14,7 +14,6 @@
 #include <logger/bpf_dbg.h>
 
 #include <common/scratch_mem.h>
-#include <common/ssl_connection.h>
 
 #include <pid/pid_helpers.h>
 
@@ -30,19 +29,6 @@ static __always_inline void print_tp(const char *msg, const tp_info_t *tp) {
     unsigned char tp_buf_str[TP_MAX_VAL_LENGTH];
     make_tp_string(tp_buf_str, tp);
     bpf_dbg_printk("%s: %s", msg, tp_buf_str);
-}
-
-static __always_inline bool sk_data_is_ssl(struct socket_data *sk_data) {
-    if (sk_data->ssl_state == ssl_state_unknown) {
-        const pid_connection_info_t p_conn = {
-            .pid = pid_from_pid_tgid(sk_data->pid_tgid),
-            .conn = sk_data->sorted_conn,
-        };
-
-        sk_data->ssl_state = is_ssl_connection(&p_conn) ? ssl_state_yes : ssl_state_no;
-    }
-
-    return sk_data->ssl_state == ssl_state_yes;
 }
 
 static __always_inline u8 request_type(const struct socket_data *sk_data) {

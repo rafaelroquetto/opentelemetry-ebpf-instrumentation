@@ -12,7 +12,6 @@
 #include <common/http_buf_size.h>
 #include <common/http_types.h>
 #include <common/scratch_mem.h>
-#include <common/ssl_connection.h>
 #include <common/tc_common.h>
 #include <common/tp_info.h>
 #include <common/trace_parent.h>
@@ -37,6 +36,7 @@
 #include <socktracer/maps/sk_tp_info_pid_map.h>
 #include <socktracer/sk_storage_data.h>
 #include <socktracer/socket_data.h>
+#include <socktracer/ssl_detect.h>
 
 volatile const u32 track_request_headers = 0;
 
@@ -293,10 +293,6 @@ static __always_inline void obi_server_egress(struct sk_msg_md *msg, struct sock
 // checks whether a higher-level uprobe has set a TP for this connection (e.g. SSL or go)
 static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
                                              struct socket_data *sk_data) {
-    if (sk_data_is_ssl(sk_data)) {
-        return true;
-    }
-
     const egress_key_t e_key = make_egress_key(&sk_data->conn);
     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);
 
@@ -330,7 +326,10 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
 static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct socket_data *sk_data) {
     bpf_dbg_enter();
 
-    if (handle_uprobe_tp(msg, sk_data)) {
+    const bool is_ssl = sk_data_is_ssl_egress(sk_data, msg);
+    const bool uprobe_handled = handle_uprobe_tp(msg, sk_data);
+
+    if (is_ssl || uprobe_handled) {
         return;
     }
 

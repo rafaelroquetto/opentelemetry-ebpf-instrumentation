@@ -127,6 +127,9 @@ static __always_inline bool handle_http_req(void *ctx, struct socket_data *sk_da
         return false;
     }
 
+    // at this stage definitively not SSL
+    sk_data->ssl_state = ssl_state_no;
+
     tailcall_ctx *t_ctx = tailcall_ctx_mem();
 
     if (!t_ctx) {

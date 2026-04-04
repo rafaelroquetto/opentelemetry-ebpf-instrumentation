@@ -27,6 +27,7 @@
 #include <socktracer/http.h>
 #include <socktracer/maps/sk_data_map.h>
 #include <socktracer/socket_data.h>
+#include <socktracer/ssl_detect.h>
 #include <socktracer/tcp.h>
 
 char __license[] SEC("license") = "Dual MIT/GPL";
@@ -266,7 +267,7 @@ int obi_socket_ingress(struct __sk_buff *skb) {
         return SK_PASS;
     }
 
-    if (sk_data_is_ssl(sk_data)) {
+    if (sk_data_is_ssl_ingress(sk_data, skb)) {
         return SK_PASS;
     }
 

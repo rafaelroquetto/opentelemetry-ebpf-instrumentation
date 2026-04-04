@@ -137,6 +137,13 @@ static __always_inline bool handle_tcp_res(void *ctx, struct socket_data *data) 
         return false;
     }
 
+    // if SSL was detected mid-connection after we already started a TCP request,
+    // discard the partial trace as the SSL uprobes will produce the correct span
+    if (data->ssl_state == ssl_state_yes) {
+        __builtin_memset(&data->request, 0, sizeof(data->request));
+        return true;
+    }
+
     tcp_req_t *tcp = &data->request.tcp;
 
     const u32 len = ctx_len(ctx);
