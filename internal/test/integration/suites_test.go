@@ -427,6 +427,16 @@ func TestSuite_PythonMySQL(t *testing.T) {
 	require.NoError(t, compose.Close())
 }
 
+func TestSuite_SocktracerMySQL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mysql.yml", path.Join(pathOutput, "test-suite-python-mysql-socktracer.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MySQL tests (socktracer)", testPythonMySQL)
+	require.NoError(t, compose.Close())
+}
+
 func TestSuite_PythonKafka(t *testing.T) {
 	compose, err := docker.ComposeSuite("docker-compose-python-kafka.yml", path.Join(pathOutput, "test-suite-python-kafka.log"))
 	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
@@ -541,6 +551,16 @@ func TestSuite_PythonSQLSSL(t *testing.T) {
 	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
 	require.NoError(t, compose.Up())
 	t.Run("Python SQL metrics", testREDMetricsPythonSQLSSL)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SocktracerPostgresSSL(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-sql-ssl.yml", path.Join(pathOutput, "test-suite-python-sql-ssl-socktracer.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Python SQL SSL metrics (socktracer)", testREDMetricsPythonSQLSSL)
 	require.NoError(t, compose.Close())
 }
 
@@ -685,6 +705,18 @@ func TestSuiteNodeClientTLS(t *testing.T) {
 	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=node`, `NODE_APP=client_tls`, `PROM_CONFIG_SUFFIX=`)
 	require.NoError(t, compose.Up())
 	t.Run("Node Client RED metrics", func(t *testing.T) {
+		testNodeClientWithMethodAndStatusCode(t, "GET", 200, 443, "0000000000000001")
+	})
+	require.NoError(t, compose.Close())
+}
+
+func TestSuiteNodeClientTLSSocktracer(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-nodeclient.yml", path.Join(pathOutput, "test-suite-nodeclient-tls-socktracer.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_EXECUTABLE_PATH=node`, `NODE_APP=client_tls`, `PROM_CONFIG_SUFFIX=`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Node Client TLS RED metrics (socktracer)", func(t *testing.T) {
 		testNodeClientWithMethodAndStatusCode(t, "GET", 200, 443, "0000000000000001")
 	})
 	require.NoError(t, compose.Close())
