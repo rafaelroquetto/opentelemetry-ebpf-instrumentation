@@ -437,12 +437,31 @@ func TestSuite_SocktracerMySQL(t *testing.T) {
 	require.NoError(t, compose.Close())
 }
 
+func TestSuite_SocktracerMySQLPlain(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mysql.yml", path.Join(pathOutput, "test-suite-python-mysql-socktracer-plain.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`, `MYSQL_SSL_DISABLED=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MySQL tests (socktracer, plaintext)", testPythonMySQL)
+	require.NoError(t, compose.Close())
+}
+
 func TestSuite_PythonKafka(t *testing.T) {
 	compose, err := docker.ComposeSuite("docker-compose-python-kafka.yml", path.Join(pathOutput, "test-suite-python-kafka.log"))
 	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
 	require.NoError(t, err)
 	require.NoError(t, compose.Up())
 	t.Run("Python Kafka tests", testREDMetricsPythonKafkaOnly)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SocktracerKafka(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-kafka.yml", path.Join(pathOutput, "test-suite-python-kafka-socktracer.log"))
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Python Kafka tests (socktracer)", testREDMetricsPythonKafkaOnly)
 	require.NoError(t, compose.Close())
 }
 
@@ -457,12 +476,32 @@ func TestSuite_PythonMQTT(t *testing.T) {
 	require.NoError(t, compose.Close())
 }
 
+func TestSuite_SocktracerMQTT(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-mqtt.yml", path.Join(pathOutput, "test-suite-python-mqtt-socktracer.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Python MQTT publish tests (socktracer)", testREDMetricsPythonMQTT)
+	t.Run("Python MQTT subscribe tests (socktracer)", testREDMetricsPythonMQTTSubscribe)
+	require.NoError(t, compose.Close())
+}
+
 func TestSuite_JavaKafka(t *testing.T) {
 	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400.yml", path.Join(pathOutput, "test-suite-java-kafka.log"))
 	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`)
 	require.NoError(t, err)
 	require.NoError(t, compose.Up())
 	t.Run("Java Kafka 4.0.0 tests", func(t *testing.T) { testJavaKafka(t, 9092, "javakafka") })
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SocktracerJavaKafka(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400.yml", path.Join(pathOutput, "test-suite-java-kafka-socktracer.log"))
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka 4.0.0 tests (socktracer)", func(t *testing.T) { testJavaKafka(t, 9092, "javakafka") })
 	require.NoError(t, compose.Close())
 }
 
@@ -481,6 +520,15 @@ func TestSuite_JavaKafkaLargeBuffer(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, compose.Up())
 	t.Run("Java Kafka 4.0.0 large buffer tests", testJavaKafkaLargeBuffer)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SocktracerJavaKafkaLargeBuffer(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-java-kafka-400-lb.yml", path.Join(pathOutput, "test-suite-java-kafka-lb-socktracer.log"))
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`, `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, err)
+	require.NoError(t, compose.Up())
+	t.Run("Java Kafka 4.0.0 large buffer tests (socktracer)", testJavaKafkaLargeBuffer)
 	require.NoError(t, compose.Close())
 }
 
@@ -517,6 +565,17 @@ func TestSuite_PythonRedis(t *testing.T) {
 	require.NoError(t, compose.Up())
 	t.Run("Python Redis metrics", testREDMetricsPythonRedisOnly)
 	runWeaverValidation(t)
+	require.NoError(t, compose.Close())
+}
+
+func TestSuite_SocktracerRedis(t *testing.T) {
+	compose, err := docker.ComposeSuite("docker-compose-python-redis.yml", path.Join(pathOutput, "test-suite-python-redis-socktracer.log"))
+	require.NoError(t, err)
+
+	compose.Env = append(compose.Env, `OTEL_EBPF_OPEN_PORT=8080`, `OTEL_EBPF_EXECUTABLE_PATH=`, `TEST_SERVICE_PORTS=8381:8080`,
+		`SEMCONV_VERSION=`+SemconvVersion(), `OTEL_EBPF_BPF_SOCKET_TRACER=true`)
+	require.NoError(t, compose.Up())
+	t.Run("Python Redis metrics (socktracer)", testREDMetricsPythonRedisOnly)
 	require.NoError(t, compose.Close())
 }
 

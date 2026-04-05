@@ -20,6 +20,8 @@ services:
     image: hatest-testserver-python-sql
     ports:
       - "${TEST_SERVICE_PORTS}"
+    environment:
+      MYSQL_SSL_DISABLED: "${MYSQL_SSL_DISABLED}"
     depends_on:
       otelcol:
         condition: service_started

@@ -51,6 +51,7 @@ services:
       OTEL_EBPF_TRACES_INSTRUMENTATIONS: "redis"
       OTEL_EBPF_METRICS_INSTRUMENTATIONS: "redis"
       OTEL_EBPF_METRICS_FEATURES: "application"
+      OTEL_EBPF_BPF_SOCKET_TRACER: "${OTEL_EBPF_BPF_SOCKET_TRACER}"
     depends_on:
       testserver:
         condition: service_started

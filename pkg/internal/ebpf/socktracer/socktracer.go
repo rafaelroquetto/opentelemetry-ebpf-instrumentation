@@ -136,11 +136,16 @@ func (p *Tracer) injectFlags() uint32 {
 	return flags
 }
 
+func (p *Tracer) tcpMaxCapturedBytes() uint32 {
+	bs := p.cfg.EBPF.BufferSizes
+	return max(bs.TCP, bs.MySQL, bs.Kafka, bs.Postgres)
+}
+
 func (p *Tracer) egressConstants() map[string]any {
 	c := make(map[string]any)
 	c["inject_flags"] = p.injectFlags()
 	c["http_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.HTTP
-	c["tcp_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.TCP
+	c["tcp_max_captured_bytes"] = p.tcpMaxCapturedBytes()
 	c["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
 	c["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 
@@ -155,7 +160,7 @@ func (p *Tracer) egressConstants() map[string]any {
 func (p *Tracer) ingressConstants() map[string]any {
 	c := make(map[string]any)
 	c["http_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.HTTP
-	c["tcp_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.TCP
+	c["tcp_max_captured_bytes"] = p.tcpMaxCapturedBytes()
 	c["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 
 	setConstant[uint32](c, "high_request_volume", p.cfg.EBPF.HighRequestVolume)

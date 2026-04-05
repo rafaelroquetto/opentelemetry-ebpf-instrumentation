@@ -145,6 +145,7 @@ services:
       OTEL_EBPF_METRICS_FEATURES: "application"
       OTEL_KAFKA_TOPIC_UUID_CACHE_SIZE: "1000"
       OTEL_EBPF_BPF_BUFFER_SIZE_KAFKA: "1024"
+      OTEL_EBPF_BPF_SOCKET_TRACER: "${OTEL_EBPF_BPF_SOCKET_TRACER}"
     depends_on:
       testserver:
         condition: service_started

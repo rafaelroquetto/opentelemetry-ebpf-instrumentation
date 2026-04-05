@@ -109,6 +109,18 @@ func ReadTCPRequestIntoSpan(parseCtx *EBPFParseContext, cfg *config.EBPFTracer, 
 	// Check if we have a SQL statement
 	op, table, sql, kind := detectSQLPayload(cfg.HeuristicSQLDetect, requestBuffer)
 	if validSQL(op, table, kind) {
+		if kind == request.DBMySQL {
+			span, err := handleMySQL(parseCtx, event, requestBuffer, responseBuffer)
+			if !errors.Is(err, errFallback) {
+				if errors.Is(err, errIgnore) {
+					return request.Span{}, true, nil
+				}
+				if err != nil {
+					return request.Span{}, true, fmt.Errorf("failed to handle MySQL event: %w", err)
+				}
+				return span, false, nil
+			}
+		}
 		return TCPToSQLToSpan(event, op, table, sql, kind, "", nil), false, nil
 	} else {
 		op, table, sql, kind = detectSQLPayload(cfg.HeuristicSQLDetect, responseBuffer)

@@ -7,6 +7,7 @@
 
 #include <common/algorithm.h>
 #include <common/common.h>
+#include <common/sql.h>
 
 #include <socktracer/common_defs.h>
 #include <socktracer/large_buffers.h>
