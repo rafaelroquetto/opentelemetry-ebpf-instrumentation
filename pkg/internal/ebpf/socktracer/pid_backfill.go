@@ -21,32 +21,29 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
-const soNetnsCookie = 71 // SO_NETNS_COOKIE, available since kernel 5.14
+const SO_NETNS_COOKIE = 71 // SO_NETNS_COOKIE, available since kernel 5.14
 
-// backfillPidForSockets walks /proc/<pid>/fd, finds all TCP sockets, and writes
-// {netns_cookie, local_port} → listener_pid_val into listener_pid_map.
-// This lets cgroup_skb/ingress and passive_est_cb resolve the server PID for
-// accepted sockets before accept() returns.
 func (p *Tracer) backfillPidForSockets(pid app.PID) {
-	pidTgid := uint64(pid)<<32 | uint64(pid)
-	val := buildListenerPidVal(pid, pidTgid)
-
 	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
 
 	entries, err := os.ReadDir(fdDir)
+
 	if err != nil {
-		p.log.Debug("backfillPidForSockets: readdir failed", "pid", pid, "error", err)
+		p.log.Debug("readdir failed", "pid", pid, "error", err)
 		return
 	}
-
-	p.log.Info("backfillPidForSockets: scanning sockets", "pid", pid, "pidTgid", pidTgid, "fds", len(entries))
 
 	pidfd, err := unix.PidfdOpen(int(pid), 0)
+
 	if err != nil {
-		p.log.Debug("backfillPidForSockets: pidfd_open failed", "pid", pid, "error", err)
+		p.log.Debug("pidfd_open failed", "pid", pid, "error", err)
 		return
 	}
+
 	defer unix.Close(pidfd)
+
+	val := buildListenerPidVal(pid)
+	p.log.Info("scanning sockets", "pid", pid, "pidTgid", val.PidTgid, "fds", len(entries))
 
 	for _, entry := range entries {
 		fdPath := filepath.Join(fdDir, entry.Name())
@@ -63,30 +60,32 @@ func (p *Tracer) backfillPidForSockets(pid app.PID) {
 
 		dupfd, err := unix.PidfdGetfd(pidfd, targetFd, 0)
 		if err != nil {
-			p.log.Debug("backfillPidForSockets: pidfd_getfd failed", "pid", pid, "fd", targetFd, "error", err)
+			p.log.Debug("pidfd_getfd failed", "pid", pid, "fd", targetFd, "error", err)
 			continue
 		}
 
-		p.log.Debug("backfillPidForSockets: found socket fd", "pid", pid, "fd", targetFd, "target", target)
+		p.log.Debug("found socket fd", "pid", pid, "fd", targetFd, "target", target)
 		p.tryBackfillFd(dupfd, val)
 		unix.Close(dupfd)
 	}
 }
 
-func buildListenerPidVal(pid app.PID, pidTgid uint64) SocktracerSockopsListenerPidVal {
-	val := SocktracerSockopsListenerPidVal{PidTgid: pidTgid}
+func buildListenerPidVal(pid app.PID) SocktracerSockopsListenerPidVal {
+	val := SocktracerSockopsListenerPidVal{PidTgid: uint64(pid)<<32 | uint64(pid)}
 
-	hostPid := uint32(pidTgid >> 32)
-	val.PidInfo.HostPid = hostPid
-	val.PidKey.Pid = hostPid
-	val.PidKey.Tid = hostPid
+	val.PidInfo.HostPid = uint32(pid)
 
 	nsPids, err := procs.FindNamespacedPids(pid)
+
 	if err == nil && len(nsPids) > 0 {
 		userPid := uint32(nsPids[len(nsPids)-1])
 		val.PidInfo.UserPid = userPid
 		val.PidKey.Pid = userPid
 		val.PidKey.Tid = userPid
+	} else {
+		// namespace info, assume root namespace
+		val.PidKey.Pid = uint32(pid)
+		val.PidKey.Tid = uint32(pid)
 	}
 
 	if info, err := os.Stat(fmt.Sprintf("/proc/%d/ns/pid", pid)); err == nil {
@@ -100,19 +99,20 @@ func buildListenerPidVal(pid app.PID, pidTgid uint64) SocktracerSockopsListenerP
 }
 
 func (p *Tracer) tryBackfillFd(fd int, val SocktracerSockopsListenerPidVal) {
-	netnsCookie, err := socketOptUint64(fd, unix.SOL_SOCKET, soNetnsCookie)
+	netnsCookie, err := socketOptUint64(fd, unix.SOL_SOCKET, SO_NETNS_COOKIE)
 	if err != nil {
-		p.log.Debug("backfillPidForSockets: SO_NETNS_COOKIE failed", "fd", fd, "error", err)
+		p.log.Debug("SO_NETNS_COOKIE failed", "fd", fd, "error", err)
 		return
 	}
 
 	sa, err := unix.Getsockname(fd)
 	if err != nil {
-		p.log.Debug("backfillPidForSockets: getsockname failed", "fd", fd, "error", err)
+		p.log.Debug("getsockname failed", "fd", fd, "error", err)
 		return
 	}
 
 	var localPort uint32
+
 	switch a := sa.(type) {
 	case *unix.SockaddrInet4:
 		localPort = uint32(a.Port)
@@ -127,10 +127,10 @@ func (p *Tracer) tryBackfillFd(fd int, val SocktracerSockopsListenerPidVal) {
 		LocalPort:   localPort,
 	}
 
-	p.log.Debug("backfillPidForSockets: writing listener pid", "netns", netnsCookie, "port", localPort, "pidTgid", val.PidTgid)
+	p.log.Debug("writing listener pid", "netns", netnsCookie, "port", localPort, "pidTgid", val.PidTgid)
 
 	if err := p.ingressObjs.ListenerPidMap.Update(key, val, ebpf.UpdateAny); err != nil {
-		p.log.Info("backfillPidForSockets: map update failed", "netns", netnsCookie, "port", localPort, "error", err)
+		p.log.Info("map update failed", "netns", netnsCookie, "port", localPort, "error", err)
 	}
 }
 

@@ -174,14 +174,12 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
     dbg_print_sockops_conn("TCP_CONNECT_CB", skops);
 
     if (!valid_pid(id)) {
-        //bpf_dbg_printk("invalid pid: %u", id & 0xffffffff);
         return;
     }
 
     struct bpf_sock *sk = skops->sk;
 
     if (!sk) {
-        bpf_printk("bpf_sock_ops_tcp_connect_cb: invalid sk");
         return;
     }
 
@@ -200,6 +198,7 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
 
     data->sk_type = sk_type_client;
     data->task_tid = get_task_tid();
+
     task_pid(&data->pid_info);
     task_tid(&data->pid_key);
 
@@ -223,33 +222,40 @@ static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skop
 
     const u64 cookie = bpf_get_socket_cookie(skops);
 
-    dbg_print_sockops_conn("ACTIVE_ESTABLISHED_CB", skops);
-
-    // Only track sockets that tcp_connect_cb already validated and set up.
-    // This prevents processes rejected by valid_pid from being added to sock_dir.
+    // only track sockets that tcp_connect_cb already validated and set up
     if (!bpf_map_lookup_elem(&sk_data_map, &cookie)) {
-        //bpf_dbg_printk("active_est: skip untracked cookie=%llu", cookie);
         return;
     }
 
-    bpf_dbg_printk("adding to sock_dir sock=%llu", cookie);
     bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
     bpf_sock_ops_set_flags(skops, BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_STATE_CB_FLAG);
 }
 
-// this runs before inet_csk_accept
+static __always_inline const struct listener_pid_val *listener_pid(struct bpf_sock_ops *skops) {
+    const struct listener_pid_key lkey = {
+        .netns_cookie = bpf_get_netns_cookie(skops),
+        .local_port   = skops->local_port,
+    };
+
+    return bpf_map_lookup_elem(&listener_pid_map, &lkey);
+}
+
 static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *skops) {
     struct bpf_sock *sk = skops->sk;
 
     if (!sk) {
-        bpf_dbg_printk("bpf_sock_ops_passive_est_cb: invalid sk");
+        return;
+    }
+
+    // check if this socket's local port belongs to a tracked process
+    const struct listener_pid_val *pid_val = listener_pid(skops);
+
+    // we are not tracking this socket
+    if (!pid_val) {
         return;
     }
 
     const u64 cookie = bpf_get_socket_cookie(skops);
-
-    bpf_printk("PASSIVE_ESTABLISHED_CB cookie=%llu", cookie);
-    dbg_print_sockops_conn("PASSIVE_ESTABLISHED_CB", skops);
 
     struct socket_data *data = init_sock_data(cookie);
 
@@ -264,28 +270,9 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
     sort_connection_info(&data->sorted_conn);
 
     data->sk_type = sk_type_server;
-
-    // Check if this socket's local port belongs to a tracked process.
-    // listener_pid_map is populated by userspace (AllowPID) from the listening socket.
-    const struct listener_pid_key lkey = {
-        .netns_cookie = bpf_get_netns_cookie(skops),
-        .local_port   = skops->local_port,
-    };
-
-    const struct listener_pid_val *pid_val = bpf_map_lookup_elem(&listener_pid_map, &lkey);
-
-    if (!pid_val) {
-        bpf_dbg_printk("passive_est: no pid for netns=%llu port=%u, skipping",
-                       lkey.netns_cookie, lkey.local_port);
-        bpf_map_delete_elem(&sk_data_map, &cookie);
-        return;
-    }
-
     data->pid_tgid = pid_val->pid_tgid;
     data->pid_info = pid_val->pid_info;
     data->pid_key  = pid_val->pid_key;
-
-    bpf_map_update_elem(&sk_data_map, &cookie, data, BPF_ANY);
 
     // store cookie in socket storage for sk_msg
     struct sk_storage_data sk_data = {.sk_cookie = cookie};
@@ -296,14 +283,10 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    // Add to sock_dir for sk_msg/egress. Safe here because we only attach
-    // sk_msg (not sk_skb/stream_verdict) to sock_dir — no psock data_ready stall.
     bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_NOEXIST);
 
     bpf_sock_ops_set_flags(skops,
                            BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_STATE_CB_FLAG);
-
-    bpf_dbg_return();
 }
 
 static __always_inline void bpf_sock_ops_opt_len_cb(struct bpf_sock_ops *skops) {

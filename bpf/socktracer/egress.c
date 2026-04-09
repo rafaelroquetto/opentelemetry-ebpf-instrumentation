@@ -38,7 +38,7 @@
 #include <socktracer/socket_data.h>
 #include <socktracer/ssl_detect.h>
 
-volatile const u32 track_request_headers = 0;
+volatile const u32 track_request_headers = 0; //FIXME implement
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -78,10 +78,9 @@ static __always_inline void set_trace(const struct socket_data *sk_data,
     set_client_trace(sk_data, tp_p);
 }
 
-// Flags to control what socktracer should inject
 enum {
-    k_inject_http_headers = 1 << 0, // Bit 0: inject HTTP headers
-    k_inject_tcp_options = 1 << 1,  // Bit 1: inject TCP options
+    k_inject_http_headers = 1 << 0,
+    k_inject_tcp_options = 1 << 1,
 };
 
 volatile const u32 inject_flags = k_inject_http_headers | k_inject_tcp_options;
@@ -151,11 +150,6 @@ static __always_inline tp_info_pid_t *get_tp_info_pid(const egress_key_t *e_key)
 static __always_inline void clear_tp_info_pid(const egress_key_t *e_key) {
     bpf_map_delete_elem(&outgoing_trace_map, e_key);
 }
-
-
-
-// this "beauty" ensures we hold pkt in the same register being range
-// validated
 
 static __always_inline bool
 extend_and_write_tp(struct sk_msg_md *msg, u32 offset, const tp_info_t *tp) {
@@ -311,7 +305,7 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
         return true;
     }
 
-    // Go plaintext (valid==1): the Go uprobe already generated the span; just inject
+    // go plaintext (valid==1): the go uprobe already generated the span; just inject
     // the Traceparent header directly using the Go TP and skip protocol handling.
     schedule_write_tcp_option(msg, tp_pid);
 
@@ -320,6 +314,7 @@ static __always_inline bool handle_uprobe_tp(struct sk_msg_md *msg,
     }
 
     clear_tp_info_pid(&e_key);
+
     sk_data->request.flags = k_request_uprobe_handled;
 
     return true;
@@ -362,13 +357,11 @@ int obi_socket_egress(struct sk_msg_md *msg) {
 
         return SK_PASS;
     }
-    const u32 len = ctx_len(msg);
-    ctx_pull_data(msg, len);
-    bpf_dbg_printk("cookie=%llu, size=%u, data =[%s]", sk_storage->sk_cookie, len, (const char*) ctx_data(msg));
-    //bpf_dbg_printk("cookie=%llu", sk_storage->sk_cookie);
 
-    if (!backfill_pid(msg, sk_data, sk_storage)) {
-       // bpf_dbg_printk("egress: cookie=%llu backfill_pid failed, passing", sk_storage->sk_cookie);
+    // if we haven't resolved the pid for this socket yet, backfill_pid will
+    // check if this is a valid (tracked) pid and set it up, or we stop tracking
+    // this socket
+    if (sk_data->pid_tgid == 0 && !backfill_pid(msg, sk_data, sk_storage)) {
         return SK_PASS;
     }
 
@@ -381,7 +374,6 @@ int obi_socket_egress(struct sk_msg_md *msg) {
         break;
     }
 
-    bpf_dbg_printk("ret %s", ctx_data(msg));
     return SK_PASS;
 }
 
