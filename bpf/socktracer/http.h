@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "bpfcore/vmlinux_amd64.h"
 #include <bpfcore/vmlinux.h>
 
 #include <common/common.h>
@@ -252,11 +253,18 @@ static __always_inline int http_found_tp(void *ctx) {
 
     unsigned char *b = ctx_data(ctx);
     const unsigned char *e = ctx_data_end(ctx);
+
+    if (off >= (0xfff - k_tp_val_len)) {
+        return SK_PASS;
+    }
+
     unsigned char *ptr = b + off;
 
     if (ptr + k_tp_val_len > e) {
         return SK_PASS;
     }
+
+    
 
     decode_hex(dest, ptr, TRACE_ID_CHAR_LEN);
 
@@ -332,9 +340,16 @@ static __always_inline int http_find_tp(void *ctx) {
         ctx_pull_data(ctx, min(ctx_len(ctx), k_max_iter * 1024));
     }
 
+    const u32 off = niter * 1024;
+
     unsigned char *b = ctx_data(ctx);
     const unsigned char *e = ctx_data_end(ctx);
-    unsigned char *ptr = b + (niter * 1024);
+
+    if (off >= (0xfff - 1024)) {
+        return SK_PASS;
+    }
+
+    unsigned char *ptr = b + off;
 
     if (ptr >= e) {
         return SK_PASS;

@@ -19,6 +19,7 @@
 
 #include <socktracer/http_core.h>
 #include <socktracer/tcp_core.h>
+#include <socktracer/maps/listener_pid_map.h>
 #include <socktracer/maps/sk_data_map.h>
 #include <socktracer/maps/sk_storage_map.h>
 #include <socktracer/maps/sk_tp_info_pid_map.h>
@@ -47,6 +48,26 @@ enum { k_tcp_option_kind_otel = 25 };
 #endif
 
 SCRATCH_MEM_SIZED(tp_str_buf, 64)
+
+static __always_inline void dbg_print_sockops_conn(const char *label, struct bpf_sock_ops *skops) {
+    const u32 lip = skops->local_ip4;
+    const u32 rip = skops->remote_ip4;
+
+    bpf_printk("%s local=%u.%u.%u.%u:%u",
+                   label,
+                   lip & 0xFF,
+                   (lip >> 8) & 0xFF,
+                   (lip >> 16) & 0xFF,
+                   (lip >> 24) & 0xFF,
+                   skops->local_port);
+    bpf_printk("%s remote=%u.%u.%u.%u:%u",
+                   label,
+                   rip & 0xFF,
+                   (rip >> 8) & 0xFF,
+                   (rip >> 16) & 0xFF,
+                   (rip >> 24) & 0xFF,
+                   bpf_ntohl(skops->remote_port));
+}
 
 static __always_inline struct socket_data *init_sock_data(u64 cookie) {
     // struct socket_data is too big to fit on the stack, so we 0 initialise
@@ -150,8 +171,10 @@ static __always_inline void bpf_sock_ops_tcp_connect_cb(struct bpf_sock_ops *sko
     const u64 cookie = bpf_get_socket_cookie(skops);
     const u64 id = bpf_get_current_pid_tgid();
 
+    dbg_print_sockops_conn("TCP_CONNECT_CB", skops);
+
     if (!valid_pid(id)) {
-        bpf_dbg_printk("invalid pid: %u", id & 0xffffffff);
+        //bpf_dbg_printk("invalid pid: %u", id & 0xffffffff);
         return;
     }
 
@@ -198,8 +221,16 @@ static __always_inline void bpf_sock_ops_set_flags(struct bpf_sock_ops *skops, u
 static __always_inline void bpf_sock_ops_active_est_cb(struct bpf_sock_ops *skops) {
     bpf_dbg_enter();
 
-    //FIXME merge with bpf_sock_ops_tcp_connect_cb
     const u64 cookie = bpf_get_socket_cookie(skops);
+
+    dbg_print_sockops_conn("ACTIVE_ESTABLISHED_CB", skops);
+
+    // Only track sockets that tcp_connect_cb already validated and set up.
+    // This prevents processes rejected by valid_pid from being added to sock_dir.
+    if (!bpf_map_lookup_elem(&sk_data_map, &cookie)) {
+        //bpf_dbg_printk("active_est: skip untracked cookie=%llu", cookie);
+        return;
+    }
 
     bpf_dbg_printk("adding to sock_dir sock=%llu", cookie);
     bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
@@ -217,6 +248,9 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
 
     const u64 cookie = bpf_get_socket_cookie(skops);
 
+    bpf_printk("PASSIVE_ESTABLISHED_CB cookie=%llu", cookie);
+    dbg_print_sockops_conn("PASSIVE_ESTABLISHED_CB", skops);
+
     struct socket_data *data = init_sock_data(cookie);
 
     if (!data) {
@@ -231,6 +265,26 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
 
     data->sk_type = sk_type_server;
 
+    // Check if this socket's local port belongs to a tracked process.
+    // listener_pid_map is populated by userspace (AllowPID) from the listening socket.
+    const struct listener_pid_key lkey = {
+        .netns_cookie = bpf_get_netns_cookie(skops),
+        .local_port   = skops->local_port,
+    };
+
+    const struct listener_pid_val *pid_val = bpf_map_lookup_elem(&listener_pid_map, &lkey);
+
+    if (!pid_val) {
+        bpf_dbg_printk("passive_est: no pid for netns=%llu port=%u, skipping",
+                       lkey.netns_cookie, lkey.local_port);
+        bpf_map_delete_elem(&sk_data_map, &cookie);
+        return;
+    }
+
+    data->pid_tgid = pid_val->pid_tgid;
+    data->pid_info = pid_val->pid_info;
+    data->pid_key  = pid_val->pid_key;
+
     bpf_map_update_elem(&sk_data_map, &cookie, data, BPF_ANY);
 
     // store cookie in socket storage for sk_msg
@@ -242,8 +296,10 @@ static __always_inline void bpf_sock_ops_passive_est_cb(struct bpf_sock_ops *sko
         return;
     }
 
-    bpf_dbg_printk("adding to sock_dir sock=%llu", cookie);
-    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_ANY);
+    // Add to sock_dir for sk_msg/egress. Safe here because we only attach
+    // sk_msg (not sk_skb/stream_verdict) to sock_dir — no psock data_ready stall.
+    bpf_sock_hash_update(skops, &sock_dir, (void *)&cookie, BPF_NOEXIST);
+
     bpf_sock_ops_set_flags(skops,
                            BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG | BPF_SOCK_OPS_STATE_CB_FLAG);
 
@@ -314,6 +370,8 @@ static __always_inline void bpf_sock_ops_write_hdr_cb(struct bpf_sock_ops *skops
 }
 
 static __always_inline void bpf_sock_ops_parse_hdr_cb(struct bpf_sock_ops *skops) {
+    bpf_dbg_enter();
+
     struct tp_option opt = {};
     opt.kind = k_tcp_option_kind_otel;
 
@@ -372,6 +430,7 @@ static __always_inline void bpf_sock_ops_state_cb(struct bpf_sock_ops *skops) {
     }
 
     const u64 cookie = bpf_get_socket_cookie(skops);
+    bpf_printk("STATE_CB closing cookie=%llu state=%d", cookie, skops->args[1]);
 
     struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
 
@@ -428,3 +487,42 @@ int obi_sockmap_tracker(struct bpf_sock_ops *skops) {
 
     return 1;
 }
+
+static __always_inline void post_bind(struct bpf_sock *sk, u32 local_port) {
+    if (!sk) {
+        return;
+    }
+
+    const u64 id = bpf_get_current_pid_tgid();
+
+    if (!valid_pid(id)) {
+        return;
+    }
+
+    const struct listener_pid_key key = {
+        .netns_cookie = bpf_get_netns_cookie(sk),
+        .local_port   = local_port,
+    };
+
+    struct listener_pid_val val = {.pid_tgid = id};
+    task_pid(&val.pid_info);
+    task_tid(&val.pid_key);
+
+    bpf_dbg_printk("post_bind: netns=%llu port=%u pid_tgid=%llu",
+                   key.netns_cookie, key.local_port, id);
+
+    bpf_map_update_elem(&listener_pid_map, &key, &val, BPF_ANY);
+}
+
+SEC("cgroup/post_bind4")
+int obi_post_bind4(struct bpf_sock *sk) {
+    post_bind(sk, sk->src_port);
+    return 1;
+}
+
+SEC("cgroup/post_bind6")
+int obi_post_bind6(struct bpf_sock *sk) {
+    post_bind(sk, sk->src_port);
+    return 1;
+}
+

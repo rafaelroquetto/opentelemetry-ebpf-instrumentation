@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <bpfcore/vmlinux.h>
+#include <bpfcore/bpf_endian.h>
 #include <bpfcore/bpf_helpers.h>
-#include <bpfcore/bpf_tracing.h>
 
 #include <common/connection_info.h>
 #include <common/runtime.h>
@@ -16,15 +16,13 @@
 
 #include <maps/incoming_trace_map.h>
 #include <maps/server_traces.h>
-#include <maps/sock_dir.h>
-
-#include <pid/pid.h>
 
 #include <shared/obi_ctx.h>
 
 #include <socktracer/common_defs.h>
 #include <socktracer/helpers.h>
 #include <socktracer/http.h>
+#include <socktracer/maps/listener_pid_map.h>
 #include <socktracer/maps/sk_data_map.h>
 #include <socktracer/socket_data.h>
 #include <socktracer/ssl_detect.h>
@@ -32,20 +30,160 @@
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
+SCRATCH_MEM_SIZED(payload_buf, 4096);
+
+// cgroup_skb/ingress: data pointer starts at the IP header (L3).
+// We compute the TCP payload offset once in the entry program, store it in
+// skb->cb[0], and all ctx_* helpers use it to hide the L3/L4 headers from the
+// protocol parsers (which expect data to start at the TCP payload).
+
+enum {
+    k_ipproto_hopopts  = 0,
+    k_ipproto_routing  = 43,
+    k_ipproto_fragment = 44,
+    k_ipproto_dstopts  = 60,
+};
+
+static __always_inline u32 ctx_compute_payload_offset_v4(struct __sk_buff *skb) {
+    void *data     = ctx_skb_data(skb);
+    void *data_end = ctx_skb_data_end(skb);
+
+    const struct iphdr *ip = data;
+
+    if ((void *)(ip + 1) > data_end) {
+        return 0;
+    }
+
+    if (ip->version != 4 || ip->protocol != IPPROTO_TCP) {
+        return 0;
+    }
+
+    const u32 ip_hlen = (u32)ip->ihl * 4;
+    if (ip_hlen < sizeof(struct iphdr)) {
+        return 0;
+    }
+
+    const struct tcphdr *tcp = data + ip_hlen;
+    if ((void *)(tcp + 1) > data_end) {
+        return 0;
+    }
+
+    const u32 tcp_hlen = (u32)tcp->doff * 4;
+    if (tcp_hlen < sizeof(struct tcphdr)) {
+        return 0;
+    }
+
+    return ip_hlen + tcp_hlen;
+}
+
+static __always_inline u32 ctx_compute_payload_offset_v6(struct __sk_buff *skb) {
+    void *data     = ctx_skb_data(skb);
+    void *data_end = ctx_skb_data_end(skb);
+
+    const struct ipv6hdr *ip6 = data;
+
+    if ((void *)(ip6 + 1) > data_end) {
+        return 0;
+    }
+
+    if (ip6->version != 6) {
+        return 0;
+    }
+
+    const void *ptr = (const void *)(ip6 + 1);
+    u8 curr_hdr = ip6->nexthdr;
+
+    // iterate at most 4 extension headers
+    for (u8 i = 0; i < 4; i++) {
+        if (curr_hdr == IPPROTO_TCP) {
+            break;
+        }
+
+        const struct ipv6_opt_hdr *opt_hdr = ptr;
+
+        if ((const void *)(opt_hdr + 1) > data_end) {
+            return 0;
+        }
+
+        switch (curr_hdr) {
+        case k_ipproto_hopopts:
+        case k_ipproto_routing:
+        case k_ipproto_dstopts:
+            ptr += ((u32)opt_hdr->hdrlen + 1) * 8;
+            break;
+        case k_ipproto_fragment:
+            ptr += 8;
+            break;
+        default:
+            return 0;
+        }
+
+        curr_hdr = opt_hdr->nexthdr;
+    }
+
+    if (curr_hdr != IPPROTO_TCP) {
+        return 0;
+    }
+
+    const struct tcphdr *tcp = ptr;
+
+    if ((const void *)(tcp + 1) > data_end) {
+        return 0;
+    }
+
+    const u32 tcp_hlen = (u32)tcp->doff * 4;
+    if (tcp_hlen < sizeof(struct tcphdr)) {
+        return 0;
+    }
+
+    return (u32)(ptr - data) + tcp_hlen;
+}
+
+static __always_inline u32 ctx_compute_payload_offset(struct __sk_buff *skb) {
+    if (skb->protocol == bpf_htons(ETH_P_IP)) {
+        return ctx_compute_payload_offset_v4(skb);
+    }
+
+    if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+        return ctx_compute_payload_offset_v6(skb);
+    }
+
+    return 0;
+}
+
 static __always_inline u32 ctx_len(void *ctx) {
-    return ((struct __sk_buff *)ctx)->len;
+    struct __sk_buff *skb = ctx;
+    const u32 offset = min(skb->cb[0], 0xff);
+    return skb->len > offset ? skb->len - offset : 0;
 }
 
 static __always_inline void ctx_pull_data(void *ctx, u32 len) {
-    bpf_skb_pull_data(ctx, len);
+    (void) ctx;
+    (void) len;
 }
 
 static __always_inline void *ctx_data(void *ctx) {
-    return ctx_skb_data((struct __sk_buff *)ctx);
+    unsigned char *p = payload_buf_mem();
+
+    if (!p) {
+        return NULL;
+    }
+
+    (void) ctx;
+    //struct __sk_buff *skb = ctx;
+
+    //p += skb->cb[0];
+
+    return p;
 }
 
 static __always_inline void *ctx_data_end(void *ctx) {
-    return ctx_skb_data_end((struct __sk_buff *)ctx);
+    (void) ctx;
+
+    unsigned char *p = payload_buf_mem();
+    p += 0xfff;
+
+    return p;
 }
 
 static __always_inline void schedule_write_tcp_option(void *ctx, tp_info_pid_t *tp_p) {
@@ -199,7 +337,7 @@ static __always_inline void write_tp_http_header(void *ctx, tailcall_ctx *t_ctx)
 }
 
 // k_tail_ingress_http_create_tp
-SEC("sk_skb/stream_verdict")
+SEC("cgroup_skb/ingress")
 int obi_ingress_http_create_tp(struct __sk_buff *skb) {
     bpf_dbg_enter();
 
@@ -214,7 +352,7 @@ init_span_id(const tailcall_ctx *t_ctx, tp_info_t *tp, unsigned char *span_id) {
     urand_bytes(tp->span_id, SPAN_ID_SIZE_BYTES);
 }
 
-SEC("sk_skb/stream_verdict")
+SEC("cgroup_skb/ingress")
 int obi_ingress_http_req(struct __sk_buff *skb) {
     bpf_dbg_enter();
 
@@ -222,11 +360,34 @@ int obi_ingress_http_req(struct __sk_buff *skb) {
 }
 
 // k_tail_ingress_http_found_tp
-SEC("sk_skb/stream_verdict")
+SEC("cgroup_skb/ingress")
 int obi_ingress_http_found_tp(struct __sk_buff *skb) {
     bpf_dbg_enter();
 
     return http_found_tp(skb);
+}
+
+// Resolves PID info for a newly accepted socket whose pid_tgid is not yet set.
+// Looks up {netns_cookie, local_port} in listener_pid_map, which is populated
+// by post_bind (BPF) and backfillPidForSockets (userspace).
+static __always_inline const struct listener_pid_val *
+resolve_listener_pid_val(struct __sk_buff *skb) {
+    const struct listener_pid_key key = {
+        .netns_cookie = bpf_get_netns_cookie(skb),
+        .local_port   = skb->local_port,
+    };
+
+    const struct listener_pid_val *val = bpf_map_lookup_elem(&listener_pid_map, &key);
+
+    if (!val) {
+        bpf_dbg_printk("resolve_pid: no entry for netns=%llu port=%u",
+                       key.netns_cookie, key.local_port);
+    } else {
+        bpf_dbg_printk("resolve_pid: found pid_tgid=%llu for netns=%llu port=%u",
+                       val->pid_tgid, key.netns_cookie, key.local_port);
+    }
+
+    return val;
 }
 
 static __always_inline void obi_server_ingress(struct __sk_buff *skb, struct socket_data *sk_data) {
@@ -238,7 +399,7 @@ static __always_inline void obi_server_ingress(struct __sk_buff *skb, struct soc
 
     // TODO: handle other protocols
 
-    if (handle_tcp(skb, sk_data)) {
+    if (handle_tcp(skb, sk_data, k_packet_direction_ingress)) {
         return;
     }
 }
@@ -250,11 +411,32 @@ static __always_inline void obi_client_ingress(struct __sk_buff *skb, struct soc
         return;
     }
 
-    handle_tcp_res(skb, sk_data);
+    handle_tcp(skb, sk_data, k_packet_direction_ingress);
 }
 
-SEC("sk_skb/stream_verdict")
+SEC("cgroup_skb/ingress")
 int obi_socket_ingress(struct __sk_buff *skb) {
+    const u32 payload_offset = ctx_compute_payload_offset(skb);
+
+    if (payload_offset == 0) {
+        // Not IPv4 TCP — pass through without processing.
+        return SK_PASS;
+    }
+
+    skb->cb[0] = payload_offset;
+
+    unsigned char *payload_mem = payload_buf_mem();
+
+    if (!payload_mem) {
+        return SK_PASS;
+    }
+
+    const u32 skb_len = skb->len & 0xfff;
+
+    if (skb_len == 0) {
+        return SK_PASS;
+    }
+
     const u64 cookie = bpf_get_socket_cookie(skb);
 
     struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &cookie);
@@ -264,14 +446,38 @@ int obi_socket_ingress(struct __sk_buff *skb) {
     }
 
     if (sk_data->pid_tgid == 0) {
+        const struct listener_pid_val *pid_val = resolve_listener_pid_val(skb);
+
+        if (!pid_val) {
+            return SK_PASS;
+        }
+
+        sk_data->pid_tgid = pid_val->pid_tgid;
+        sk_data->pid_info  = pid_val->pid_info;
+        sk_data->pid_key   = pid_val->pid_key;
+    }
+
+    if (payload_offset >= skb_len) {
         return SK_PASS;
     }
+
+    const u32 payload_len = (skb_len - payload_offset) & 0xfff;
+
+    if (payload_len == 0) {
+        return SK_PASS;
+    }
+
+    if (bpf_skb_load_bytes(skb, payload_offset, payload_mem, payload_len) != 0) {
+        return SK_PASS;
+    }
+
+    bpf_dbg_printk("obi_socket_ingress: cookie=%llu, payload_len=%u offset = %u data=[%s]",
+        cookie, ctx_len(skb), payload_offset, ctx_data(skb));
 
     if (sk_data_is_ssl_ingress(sk_data, skb)) {
+        bpf_dbg_printk("ingress: cookie=%llu ssl, skipping", cookie);
         return SK_PASS;
     }
-
-    bpf_dbg_printk("cookie=%llu", cookie);
 
     switch (sk_data->sk_type) {
     case sk_type_server:
@@ -285,58 +491,3 @@ int obi_socket_ingress(struct __sk_buff *skb) {
     return SK_PASS;
 }
 
-static __always_inline int backfill_accepted_pid(u64 accepted_cookie) {
-    const u64 id = bpf_get_current_pid_tgid();
-
-    if (!valid_pid(id)) {
-        // stop tracking this socket
-        bpf_map_delete_elem(&sk_data_map, &accepted_cookie);
-        return 0;
-    }
-
-    const u32 pid = id;
-
-    bpf_dbg_printk("pid=%u, accepted_cookie=%llu", pid, accepted_cookie);
-
-    struct socket_data *data = bpf_map_lookup_elem(&sk_data_map, &accepted_cookie);
-
-    if (!data) {
-        bpf_dbg_printk("BUG: socket should be tracked, but isn't");
-        return 0;
-    }
-
-    data->pid_tgid = id;
-    data->accept_time = bpf_ktime_get_ns();
-    data->task_tid = get_task_tid();
-    task_pid(&data->pid_info);
-    task_tid(&data->pid_key);
-
-    return 0;
-}
-
-// used to map a socket cookie to a pid
-SEC("fexit/inet_csk_accept")
-int BPF_PROG(obi_inet_csk_accept, struct sock *sk, void *arg, struct sock *accepted_sk) {
-    (void)arg;
-
-    const u64 cookie = bpf_get_socket_cookie(sk);
-    const u64 accepted_cookie = bpf_get_socket_cookie(accepted_sk);
-
-    bpf_dbg_printk("cookie=%llu, accepted_cookie=%llu", cookie, accepted_cookie);
-
-    return backfill_accepted_pid(accepted_cookie);
-}
-
-// Fallback for arm64 kernels < 6.0 where BPF trampolines (fexit) are unavailable.
-// bpf_get_socket_cookie() requires a skb/sock_ops context, so we read the cookie
-// directly from the sock structure via BTF.
-SEC("kretprobe/inet_csk_accept")
-int BPF_KRETPROBE(obi_kret_inet_csk_accept, struct sock *accepted_sk) {
-    if (!accepted_sk) {
-        return 0;
-    }
-
-    const u64 accepted_cookie = BPF_CORE_READ(accepted_sk, __sk_common.skc_cookie.counter);
-
-    return backfill_accepted_pid(accepted_cookie);
-}

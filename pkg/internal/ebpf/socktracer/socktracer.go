@@ -11,7 +11,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -69,6 +68,7 @@ func (p *Tracer) AllowPID(pid app.PID, _ uint32, _ *svc.Attrs) {
 	p.pidsMu.Lock()
 	defer p.pidsMu.Unlock()
 	p.pids[pid] = struct{}{}
+	p.backfillPidForSockets(pid)
 }
 
 func (p *Tracer) BlockPID(pid app.PID, _ uint32) {
@@ -164,7 +164,6 @@ func (p *Tracer) ingressConstants() map[string]any {
 	c["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 
 	setConstant[uint32](c, "high_request_volume", p.cfg.EBPF.HighRequestVolume)
-	setConstant[int32](c, "filter_pids", !p.cfg.Discovery.BPFPidFilterOff)
 	c["wakeup_data_bytes"] = uint32(p.cfg.EBPF.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{}))
 
 	return c
@@ -201,13 +200,7 @@ func (p *Tracer) GoProbes() map[string][]*ebpfcommon.ProbeDesc {
 }
 
 func (p *Tracer) KProbes() map[string]ebpfcommon.ProbeDesc {
-	if p.supportsTrampolines() {
-		return nil
-	}
-
-	return map[string]ebpfcommon.ProbeDesc{
-		"inet_csk_accept": {End: p.ingressObjs.ObiKretInetCskAccept},
-	}
+	return nil
 }
 
 func (p *Tracer) Tracepoints() map[string]ebpfcommon.ProbeDesc {
@@ -229,20 +222,26 @@ func (p *Tracer) SockMsgs() []ebpfcommon.SockMsg {
 			MapFD:    p.sockopsObjs.SockDir.FD(),
 			AttachAs: ebpf.AttachSkMsgVerdict,
 		},
-		{
-			Program:  p.ingressObjs.ObiSocketIngress,
-			MapFD:    p.sockopsObjs.SockDir.FD(),
-			AttachAs: ebpf.AttachSkSKBStreamVerdict,
-		},
 	}
 }
 
 func (p *Tracer) SockOps() []ebpfcommon.SockOps {
-	//return nil
 	return []ebpfcommon.SockOps{
 		{
 			Program:  p.sockopsObjs.ObiSockmapTracker,
 			AttachAs: ebpf.AttachCGroupSockOps,
+		},
+		{
+			Program:  p.ingressObjs.ObiSocketIngress,
+			AttachAs: ebpf.AttachCGroupInetIngress,
+		},
+		{
+			Program:  p.sockopsObjs.ObiPostBind4,
+			AttachAs: ebpf.AttachCGroupInet4PostBind,
+		},
+		{
+			Program:  p.sockopsObjs.ObiPostBind6,
+			AttachAs: ebpf.AttachCGroupInet6PostBind,
 		},
 	}
 }
@@ -267,23 +266,8 @@ func (p *Tracer) Iters() []*ebpfcommon.Iter {
 	return p.iters
 }
 
-func (p *Tracer) supportsTrampolines() bool {
-	// BPF trampolines (fexit) are not supported on arm64 kernels < 6.0.
-	major, minor := ebpfcommon.KernelVersion()
-	return !(runtime.GOARCH == "arm64" && (major < 6 || (major == 6 && minor == 0)))
-}
-
 func (p *Tracer) Tracing() []*ebpfcommon.Tracing {
-	if !p.supportsTrampolines() {
-		return nil
-	}
-
-	return []*ebpfcommon.Tracing{
-		{
-			Program:  p.ingressObjs.ObiInetCskAccept,
-			AttachAs: ebpf.AttachTraceFExit,
-		},
-	}
+	return nil
 }
 
 func (p *Tracer) RecordInstrumentedLib(uint64, []io.Closer) {}

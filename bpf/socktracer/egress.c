@@ -270,6 +270,8 @@ static __always_inline bool backfill_pid_from_current(struct socket_data *sk_dat
 static __always_inline bool backfill_pid(struct sk_msg_md *msg,
                                          struct socket_data *sk_data,
                                          const struct sk_storage_data *sk_storage) {
+    (void)msg;
+
     if (backfill_pid_from_current(sk_data)) {
         return true;
     }
@@ -287,7 +289,7 @@ static __always_inline void obi_server_egress(struct sk_msg_md *msg, struct sock
         return;
     }
 
-    handle_tcp_res(msg, sk_data);
+    handle_tcp(msg, sk_data, k_packet_direction_egress);
 }
 
 // checks whether a higher-level uprobe has set a TP for this connection (e.g. SSL or go)
@@ -337,7 +339,7 @@ static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct sock
         return;
     }
 
-    handle_tcp(msg, sk_data);
+    handle_tcp(msg, sk_data, k_packet_direction_egress);
 }
 
 SEC("sk_msg")
@@ -349,19 +351,24 @@ int obi_socket_egress(struct sk_msg_md *msg) {
         return SK_PASS;
     }
 
+    bpf_dbg_printk("egress: cookie=%llu, size=%u", sk_storage->sk_cookie, msg->size);
+
     struct socket_data *sk_data = bpf_map_lookup_elem(&sk_data_map, &sk_storage->sk_cookie);
 
     if (!sk_data) {
-        bpf_printk("socket no longer tracked, cleaning up storage");
+        bpf_printk("egress: cookie=%llu not in sk_data_map, cleaning up storage", sk_storage->sk_cookie);
 
         bpf_sk_storage_delete(&sk_storage_map, msg->sk);
 
         return SK_PASS;
     }
-
-    bpf_dbg_printk("cookie=%llu", sk_storage->sk_cookie);
+    const u32 len = ctx_len(msg);
+    ctx_pull_data(msg, len);
+    bpf_dbg_printk("cookie=%llu, size=%u, data =[%s]", sk_storage->sk_cookie, len, (const char*) ctx_data(msg));
+    //bpf_dbg_printk("cookie=%llu", sk_storage->sk_cookie);
 
     if (!backfill_pid(msg, sk_data, sk_storage)) {
+       // bpf_dbg_printk("egress: cookie=%llu backfill_pid failed, passing", sk_storage->sk_cookie);
         return SK_PASS;
     }
 

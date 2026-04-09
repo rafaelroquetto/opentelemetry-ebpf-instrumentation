@@ -5,6 +5,7 @@ package integration // import "go.opentelemetry.io/obi/internal/test/integration
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -26,16 +27,24 @@ func runMQTTTestCase(t *testing.T, testCase TestCase) {
 		comm    = testCase.Comm
 	)
 
+	fmt.Printf("RUNNING!!!!\n")
 	// Re-trigger the MQTT operation on each poll iteration. The first attempt
 	// may arrive before OBI's kprobes are attached, so retrying ensures at
 	// least one operation is captured after instrumentation is active.
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		fmt.Printf("MAKING NEW REQUEST TO %s\n", url+"/"+urlPath)
 		req, err := http.NewRequest(http.MethodGet, url+"/"+urlPath, nil)
+		fmt.Printf("MADE NEW REQUEST TO %s\n", url+"/"+urlPath)
+		fmt.Printf("0\n")
 		require.NoError(ct, err, "failed to create HTTP request")
 		resp, err := testHTTPClient.Do(req)
+		fmt.Printf("1\n")
 		require.NoError(ct, err, "failed to execute HTTP request")
+		resp.Body.Close()
+		fmt.Printf("2\n")
 		require.Equal(ct, http.StatusOK, resp.StatusCode, "unexpected status code")
 
+		fmt.Printf("3\n")
 		for _, span := range testCase.Spans {
 			resp, err := http.Get(jaegerQueryURL + "?service=" + comm + "&limit=1000")
 			require.NoError(ct, err, "failed to query jaeger for %s", comm)
@@ -45,6 +54,7 @@ func runMQTTTestCase(t *testing.T, testCase TestCase) {
 			require.Equal(ct, http.StatusOK, resp.StatusCode, "unexpected status code for jaeger query")
 			var tq jaeger.TracesQuery
 			require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq), "failed to decode jaeger response")
+			resp.Body.Close()
 			var tags []jaeger.Tag
 			for _, attr := range span.Attributes {
 				tags = append(tags, otelAttributeToJaegerTag(attr))
@@ -139,6 +149,7 @@ func waitForMQTTTestComponents(t *testing.T, url string, subpath string) {
 		require.NoError(ct, err)
 		r, err := testHTTPClient.Do(req)
 		require.NoError(ct, err)
+		r.Body.Close()
 		require.Equal(ct, http.StatusOK, r.StatusCode)
 	}, time.Minute, time.Second)
 }

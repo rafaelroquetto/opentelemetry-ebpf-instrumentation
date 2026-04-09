@@ -7,4 +7,5 @@
 
 struct sk_storage_data {
     u64 sk_cookie;
+    u64 pid_tgid;
 };

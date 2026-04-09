@@ -132,7 +132,7 @@ int obi_sk_iter_tcp(struct bpf_iter__tcp *ctx) {
 
     const u8 state = BPF_CORE_READ(skc, skc_state);
 
-    if (state == TCP_LISTEN || state == TCP_CLOSE) {
+    if (state != TCP_ESTABLISHED) {
         return 0;
     }
 
@@ -151,12 +151,13 @@ int obi_sk_iter_tcp(struct bpf_iter__tcp *ctx) {
 
     struct seq_file *seq = ctx->meta->seq;
 
-    BPF_SEQ_PRINTF(seq, "Tracking socket cookie=%llu src=%s dst=%s\n", cookie, src_buf, dst_buf);
+    BPF_SEQ_PRINTF(seq, "Tracking socket cookie=%llu state=%u src=%s dst=%s\n", cookie, state, src_buf, dst_buf);
 
-    bpf_d_printk("Tracking socket cookie=%llu src=%s dst=%s", cookie, src_buf, dst_buf);
+    bpf_d_printk("Tracking socket cookie=%llu state=%u src=%s dst=%s", cookie, state, src_buf, dst_buf);
 
+    // Pre-existing socket at OBI startup: full initialisation.
     if (bpf_map_update_elem(&sock_dir, &cookie, skc, BPF_NOEXIST) != 0) {
-        bpf_dbg_printk("Failed to track sock cookie=%llu", cookie);
+        bpf_dbg_printk("sock_dir already has cookie=%llu, skipping", cookie);
         return 0;
     }
 
