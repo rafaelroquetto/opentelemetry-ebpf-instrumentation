@@ -610,6 +610,30 @@ func http2SpanFromTCPEvent(parseCtx *EBPFParseContext, event *TCPRequestInfo, re
 	return http2TCPToSpan(event, method, path, peer, host, status, proto), false, nil
 }
 
+func ReadHTTP2BufferIntoSpan(parseCtx *EBPFParseContext, record *ringbuf.Record, filter ServiceFilter) (request.Span, bool, error) {
+	event, err := ReinterpretCast[TCPRequestInfo](record.RawSample)
+	if err != nil {
+		return request.Span{}, true, err
+	}
+
+	if !filter.ValidPID(app.PID(event.Pid.UserPid), event.Pid.Ns, PIDTypeKProbes) {
+		return request.Span{}, true, nil
+	}
+
+	l := int(event.Len)
+	if l < 0 || len(event.Buf) < l {
+		l = len(event.Buf)
+	}
+	pkt := largebuf.NewLargeBufferFrom(event.Buf[:l])
+	empty := largebuf.NewLargeBufferFrom(event.Buf[:0])
+
+	// TCP_SEND (directionSend=1) = request direction; TCP_RECV (directionRecv=0) = response direction.
+	if event.Direction == directionSend {
+		return http2SpanFromTCPEvent(parseCtx, event, pkt, empty)
+	}
+	return http2SpanFromTCPEvent(parseCtx, event, empty, pkt)
+}
+
 func ReadHTTP2InfoIntoSpan(parseContext *EBPFParseContext, record *ringbuf.Record, filter ServiceFilter) (request.Span, bool, error) {
 	event, err := ReinterpretCast[BPFHTTP2Info](record.RawSample)
 	if err != nil {

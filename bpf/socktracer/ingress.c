@@ -22,6 +22,7 @@
 #include <socktracer/common_defs.h>
 #include <socktracer/helpers.h>
 #include <socktracer/http.h>
+#include <socktracer/http2.h>
 #include <socktracer/maps/listener_pid_map.h>
 #include <socktracer/maps/sk_data_map.h>
 #include <socktracer/socket_data.h>
@@ -393,6 +394,10 @@ resolve_listener_pid_val(struct __sk_buff *skb) {
 static __always_inline void obi_server_ingress(struct __sk_buff *skb, struct socket_data *sk_data) {
     bpf_dbg_enter();
 
+    if (handle_http2(skb, sk_data, k_packet_direction_ingress)) {
+        return;
+    }
+
     if (handle_http_req(skb, sk_data)) {
         return;
     }
@@ -406,6 +411,10 @@ static __always_inline void obi_server_ingress(struct __sk_buff *skb, struct soc
 
 static __always_inline void obi_client_ingress(struct __sk_buff *skb, struct socket_data *sk_data) {
     bpf_dbg_enter();
+
+    if (handle_http2(skb, sk_data, k_packet_direction_ingress)) {
+        return;
+    }
 
     if (handle_http_res(skb, sk_data)) {
         return;

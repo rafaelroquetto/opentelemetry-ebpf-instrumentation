@@ -30,13 +30,14 @@
 #include <socktracer/common_defs.h>
 #include <socktracer/helpers.h>
 #include <socktracer/http.h>
-#include <socktracer/tcp.h>
+#include <socktracer/http2.h>
 #include <socktracer/maps/sk_data_map.h>
 #include <socktracer/maps/sk_storage_map.h>
 #include <socktracer/maps/sk_tp_info_pid_map.h>
 #include <socktracer/sk_storage_data.h>
 #include <socktracer/socket_data.h>
 #include <socktracer/ssl_detect.h>
+#include <socktracer/tcp.h>
 
 volatile const u32 track_request_headers = 0; //FIXME implement
 
@@ -279,6 +280,10 @@ static __always_inline bool backfill_pid(struct sk_msg_md *msg,
 static __always_inline void obi_server_egress(struct sk_msg_md *msg, struct socket_data *sk_data) {
     bpf_dbg_enter();
 
+    if (handle_http2(msg, sk_data, k_packet_direction_egress)) {
+        return;
+    }
+
     if (handle_http_res(msg, sk_data)) {
         return;
     }
@@ -327,6 +332,10 @@ static __always_inline void obi_client_egress(struct sk_msg_md *msg, struct sock
     const bool uprobe_handled = handle_uprobe_tp(msg, sk_data);
 
     if (is_ssl || uprobe_handled) {
+        return;
+    }
+
+    if (handle_http2(msg, sk_data, k_packet_direction_egress)) {
         return;
     }
 
